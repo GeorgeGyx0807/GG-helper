@@ -1,0 +1,193 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  ApprovalRule,
+  Grant,
+  MemoryItem,
+  RunEvent,
+  RunSnapshot,
+  SessionDetail,
+  SessionSummary,
+  Settings,
+} from "../types";
+
+export type GatewayInfo = { base_url: string; token: string };
+
+export async function resolveGatewayInfo(): Promise<GatewayInfo> {
+  try {
+    return await invoke<GatewayInfo>("gateway_info");
+  } catch {
+    const base_url = import.meta.env.VITE_PICO_GATEWAY_URL || "http://127.0.0.1:8765";
+    const token = import.meta.env.VITE_PICO_GATEWAY_TOKEN || "";
+    return { base_url, token };
+  }
+}
+
+export class GatewayClient {
+  constructor(private info: GatewayInfo) {}
+
+  async waitUntilHealthy(timeoutMs = 30_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: unknown;
+    do {
+      try {
+        return await this.health();
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+      }
+    } while (Date.now() < deadline);
+    throw lastError instanceof Error ? lastError : new Error("Poppy local gateway did not start");
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const response = await fetch(`${this.info.base_url}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Pico-Token": this.info.token,
+        ...(init.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(body.detail || `Gateway request failed (${response.status})`);
+    }
+    if (response.status === 204) return undefined as T;
+    return response.json() as Promise<T>;
+  }
+
+  health() {
+    return this.request<{ status: string }>("/health");
+  }
+
+  sessions() {
+    return this.request<SessionSummary[]>("/sessions");
+  }
+
+  session(id: string) {
+    return this.request<SessionDetail>(`/sessions/${id}`);
+  }
+
+  createSession(workspace_root: string, title = "New conversation") {
+    return this.request<SessionSummary>("/sessions", {
+      method: "POST",
+      body: JSON.stringify({ workspace_root, title }),
+    });
+  }
+
+  renameSession(id: string, title: string) {
+    return this.request<SessionSummary>(`/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    });
+  }
+
+  startRun(session_id: string, message: string, attachments: string[] = []) {
+    return this.request<RunSnapshot>("/runs", {
+      method: "POST",
+      body: JSON.stringify({ session_id, message, attachments }),
+    });
+  }
+
+  cancelRun(runId: string) {
+    return this.request<RunSnapshot>(`/runs/${runId}/cancel`, { method: "POST" });
+  }
+
+  approve(runId: string, approvalId: string, decision: "allow_once" | "allow_always" | "deny") {
+    return this.request(`/runs/${runId}/approvals/${approvalId}`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
+  }
+
+  connectEvents(runId: string, onEvent: (event: RunEvent) => void, onClose: () => void) {
+    const wsBase = this.info.base_url.replace(/^http/, "ws");
+    let socket: WebSocket | undefined;
+    let retryTimer: number | undefined;
+    let stopped = false;
+    let lastSequence = 0;
+
+    const connect = () => {
+      socket = new WebSocket(
+        `${wsBase}/events?token=${encodeURIComponent(this.info.token)}&run_id=${encodeURIComponent(runId)}&after_sequence=${lastSequence}`,
+      );
+      socket.onmessage = (message) => {
+        const event = JSON.parse(message.data) as RunEvent;
+        if (event.sequence <= lastSequence) return;
+        lastSequence = event.sequence;
+        onEvent(event);
+      };
+      socket.onclose = (event) => {
+        if (stopped) return;
+        if (event.code === 1000) {
+          onClose();
+          return;
+        }
+        retryTimer = window.setTimeout(connect, 350);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      socket?.close();
+    };
+  }
+
+  settings() {
+    return this.request<Settings>("/settings");
+  }
+
+  updateSettings(values: Partial<Settings>) {
+    return this.request<Settings>("/settings", {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    });
+  }
+
+  grants() {
+    return this.request<Grant[]>("/grants");
+  }
+
+  addGrant(path: string, can_write = false, can_shell = false) {
+    return this.request<Grant>("/grants", {
+      method: "POST",
+      body: JSON.stringify({ path, can_read: true, can_write, can_shell }),
+    });
+  }
+
+  deleteGrant(id: string) {
+    return this.request<void>(`/grants/${id}`, { method: "DELETE" });
+  }
+
+  memories() {
+    return this.request<MemoryItem[]>("/memories");
+  }
+
+  addMemory(content: string, category = "preference") {
+    return this.request<MemoryItem>("/memories", {
+      method: "POST",
+      body: JSON.stringify({ content, category }),
+    });
+  }
+
+  updateMemory(id: string, content: string) {
+    return this.request<MemoryItem>(`/memories/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content }),
+    });
+  }
+
+  deleteMemory(id: string) {
+    return this.request<void>(`/memories/${id}`, { method: "DELETE" });
+  }
+
+  approvalRules() {
+    return this.request<ApprovalRule[]>("/approval-rules");
+  }
+
+  deleteApprovalRule(id: string) {
+    return this.request<void>(`/approval-rules/${id}`, { method: "DELETE" });
+  }
+}

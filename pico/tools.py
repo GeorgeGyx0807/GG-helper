@@ -4,9 +4,12 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import os
+import signal
 import shutil
 import subprocess
 import textwrap
+import time
 from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES
@@ -217,26 +220,58 @@ def tool_run_shell(context, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
-    result = subprocess.run(
+    context.raise_if_cancelled()
+    process = subprocess.Popen(
         command,
         cwd=context.root,
         shell=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        start_new_session=True,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
         env=context.shell_env(),
     )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            context.raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        _terminate_process_group(process)
+        raise
     return textwrap.dedent(
         f"""\
-        exit_code: {result.returncode}
+        exit_code: {process.returncode}
         stdout:
-        {result.stdout.strip() or "(empty)"}
+        {stdout.strip() or "(empty)"}
         stderr:
-        {result.stderr.strip() or "(empty)"}
+        {stderr.strip() or "(empty)"}
         """
     ).strip()
+
+
+def _terminate_process_group(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=1)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=1)
 
 
 def tool_write_file(context, args):

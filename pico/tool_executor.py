@@ -2,8 +2,10 @@
 
 from dataclasses import dataclass
 import re
+from uuid import uuid4
 
 from .workspace import clip
+from .application.cancellation import RunCancelled
 
 
 @dataclass(frozen=True)
@@ -97,7 +99,29 @@ class ToolExecutor:
                 ),
             )
 
-        if tool["risky"] and not agent.approve(name, args):
+        agent.cancellation_token.raise_if_cancelled()
+        approval_id = "approval_" + uuid4().hex
+        preapproved = bool(tool["risky"] and agent.is_tool_preapproved(name, args))
+        if tool["risky"] and not preapproved:
+            agent.emit_event(
+                "tool.approval_required",
+                {
+                    "approval_id": approval_id,
+                    "tool_name": name,
+                    "arguments": dict(args or {}),
+                    "risk_level": "high",
+                },
+            )
+        if tool["risky"] and not preapproved and not agent.approve(name, args, approval_id=approval_id):
+            agent.emit_event(
+                "tool.failed",
+                {
+                    "approval_id": approval_id,
+                    "tool_name": name,
+                    "status": "rejected",
+                    "error_code": "approval_denied",
+                },
+            )
             return ToolExecutionResult(
                 content=f"error: approval denied for {name}",
                 metadata=_metadata(
@@ -112,7 +136,17 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
+            agent.cancellation_token.raise_if_cancelled()
+            agent.emit_event(
+                "tool.started",
+                {
+                    "tool_name": name,
+                    "arguments": dict(args or {}),
+                    "risk_level": "high" if tool["risky"] else "low",
+                },
+            )
             content = clip(tool["run"](args))
+            agent.cancellation_token.raise_if_cancelled()
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -139,7 +173,19 @@ class ToolExecutor:
                 diff_summary=diff_summary,
             )
             agent.record_process_note_for_tool(name, metadata)
+            agent.emit_event(
+                "tool.completed" if tool_status == "ok" else "tool.failed",
+                {
+                    "tool_name": name,
+                    "status": tool_status,
+                    "output": content,
+                    **metadata,
+                },
+            )
             return ToolExecutionResult(content=content, metadata=metadata)
+        except RunCancelled:
+            agent.emit_event("tool.failed", {"tool_name": name, "status": "cancelled", "error_code": "cancelled"})
+            raise
         except Exception as exc:
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
@@ -157,4 +203,14 @@ class ToolExecutor:
                 diff_summary=diff_summary,
             )
             agent.record_process_note_for_tool(name, metadata)
+            agent.emit_event(
+                "tool.failed",
+                {
+                    "tool_name": name,
+                    "status": metadata["tool_status"],
+                    "error_code": metadata["tool_error_code"],
+                    "output": f"error: tool {name} failed: {exc}",
+                    **metadata,
+                },
+            )
             return ToolExecutionResult(content=f"error: tool {name} failed: {exc}", metadata=metadata)

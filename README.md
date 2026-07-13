@@ -1,4 +1,10 @@
-# pico
+# Poppy
+
+Poppy 是基于现有 Pico Runtime 构建的 macOS 桌面个人助手。它使用 DeepSeek 云 API，支持流式聊天、会话恢复、明确的文件夹授权、工具执行卡片、风险操作审批、停止任务、附件、个人记忆、明暗主题、系统托盘和全局快捷键。
+
+桌面版的安装、使用与构建说明见 [Poppy 桌面版指南](docs/poppy-desktop.md)。Python 包和命令行兼容层仍保留名称 `pico`，方便继续复用已有 Runtime 和 CLI。
+
+## Pico CLI
 
 `pico` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.pico/` 目录里。
 

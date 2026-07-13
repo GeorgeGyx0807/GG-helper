@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .application.cancellation import CancellationToken
+
 
 @dataclass
 class ToolContext:
@@ -13,9 +15,14 @@ class ToolContext:
     depth: int
     max_depth: int
     spawn_delegate: Callable[[dict], str]
+    cancellation_token: CancellationToken = None
 
     def path(self, raw_path):
         return self.path_resolver(str(raw_path))
 
     def shell_env(self):
         return self.shell_env_provider()
+
+    def raise_if_cancelled(self):
+        if self.cancellation_token is not None:
+            self.cancellation_token.raise_if_cancelled()

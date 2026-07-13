@@ -7,13 +7,18 @@ name = "pico"
 version = "0.1.0"
 description = "Small local coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, and Ollama models"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
 
 [project.scripts]
 pico = "pico.cli:main"
 
 [dependency-groups]
 dev = [
+  "httpx2>=2.5,<3",
+  "pyinstaller>=6.21.0",
   "pytest>=8.3.5",
   "ruff>=0.4.4",
 ]

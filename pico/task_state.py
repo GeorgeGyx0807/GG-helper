@@ -12,6 +12,7 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
 
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
@@ -22,6 +23,7 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_CANCELLED = "cancelled"
 
 
 @dataclass
@@ -93,6 +95,9 @@ class TaskState:
         self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
         self.final_answer = str(final_answer)
         return self
+
+    def cancel(self, final_answer="Run cancelled."):
+        return self.stop(STOP_REASON_CANCELLED, status=STATUS_CANCELLED, final_answer=final_answer)
 
     def to_dict(self):
         return {

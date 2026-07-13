@@ -11,6 +11,8 @@ from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
+from ..application.cancellation import CancellationToken
+
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 
 
@@ -439,3 +441,104 @@ class AnthropicCompatibleModelClient:
         if text:
             return text
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+
+    def complete_stream(
+        self,
+        prompt,
+        max_new_tokens,
+        on_delta,
+        cancellation_token=None,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+    ):
+        """Stream Anthropic-compatible text deltas while preserving complete() semantics."""
+        del prompt_cache_key, prompt_cache_retention
+        token = cancellation_token or CancellationToken()
+        self.last_completion_metadata = {}
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": True,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+
+        request = urllib.request.Request(
+            self.base_url + "/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            token.raise_if_cancelled()
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    text_parts = []
+                    input_tokens = None
+                    output_tokens = None
+                    for raw_line in response:
+                        token.raise_if_cancelled()
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        body = line[len("data:"):].strip()
+                        if not body or body == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(body)
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = event.get("type", "")
+                        if event_type == "message_start":
+                            usage = (event.get("message") or {}).get("usage") or {}
+                            input_tokens = usage.get("input_tokens")
+                        elif event_type == "content_block_delta":
+                            delta = event.get("delta") or {}
+                            text = delta.get("text") if delta.get("type") == "text_delta" else None
+                            if isinstance(text, str) and text:
+                                text_parts.append(text)
+                                on_delta(text)
+                        elif event_type == "message_delta":
+                            usage = event.get("usage") or {}
+                            output_tokens = usage.get("output_tokens")
+                    token.raise_if_cancelled()
+                    text = "".join(text_parts)
+                    if not text:
+                        raise RuntimeError("Anthropic-compatible error: stream contained no text")
+                    self.last_completion_metadata = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": (
+                            input_tokens + output_tokens
+                            if isinstance(input_tokens, int) and isinstance(output_tokens, int)
+                            else None
+                        ),
+                    }
+                    return text
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the Anthropic-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc

@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from .session_store import SessionStore
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from . import tools as toolkit
+from .application.cancellation import CancellationToken
+from .application.events import RunEvent
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
@@ -68,6 +71,10 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        event_handler=None,
+        approval_handler=None,
+        approval_precheck_handler=None,
+        cancellation_token=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -85,6 +92,11 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.event_handler = event_handler
+        self.approval_handler = approval_handler
+        self.approval_precheck_handler = approval_precheck_handler
+        self.cancellation_token = cancellation_token or CancellationToken()
+        self._event_sequences = defaultdict(int)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -234,7 +246,12 @@ class Pico:
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
-        return self.memory.render_memory_text()
+        rendered = self.memory.render_memory_text()
+        provider = getattr(self, "personal_memory_provider", None)
+        personal = str(provider() if callable(provider) else "").strip()
+        if personal:
+            rendered += "\n\nPersonal memory (explicitly managed by the user):\n" + personal
+        return rendered
 
     def history_text(self):
         history = self.session["history"]
@@ -499,10 +516,49 @@ class Pico:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
-    def ask(self, user_message):
+    def ask(self, user_message, run_id=None):
         from .agent_loop import AgentLoop
 
-        return AgentLoop(self).run(user_message)
+        return AgentLoop(self).run(user_message, run_id=run_id)
+
+    def emit_event(self, event_type, payload=None, run_id=None):
+        if self.event_handler is None:
+            return None
+        resolved_run_id = run_id or getattr(self.current_task_state, "run_id", "")
+        self._event_sequences[resolved_run_id] += 1
+        event = RunEvent(
+            event_type=str(event_type),
+            run_id=resolved_run_id,
+            session_id=self.session["id"],
+            sequence=self._event_sequences[resolved_run_id],
+            payload=dict(payload or {}),
+        )
+        self.event_handler(event.to_dict())
+        return event
+
+    def emit_model_delta(self, delta):
+        if delta:
+            self.emit_event("message.delta", {"delta": str(delta)})
+
+    def configure_run_controls(
+        self,
+        cancellation_token=None,
+        event_handler=None,
+        approval_handler=None,
+        approval_precheck_handler=None,
+    ):
+        self.cancellation_token = cancellation_token or CancellationToken()
+        self.event_handler = event_handler
+        self.approval_handler = approval_handler
+        self.approval_precheck_handler = approval_precheck_handler
+        # Tool runners close over ToolContext, so replacing a cancellation token
+        # must also refresh the registry to keep every execution path on the same token.
+        self.tools = self._apply_tool_allowlist(self.build_tools())
+        self.tool_executor = ToolExecutor(self)
+        return self
+
+    def cancel(self):
+        self.cancellation_token.cancel()
 
     def execute_tool(self, name, args):
         result = self.tool_executor.execute(name, args)
@@ -583,6 +639,7 @@ class Pico:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
+            cancellation_token=self.cancellation_token,
         )
 
     def spawn_delegate(self, args):
@@ -628,18 +685,37 @@ class Pico:
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self.tool_context(), args)
 
-    def approve(self, name, args):
+    def approve(self, name, args, approval_id=""):
         if self.read_only:
             return False
         if self.approval_policy == "auto":
             return True
         if self.approval_policy == "never":
             return False
+        if self.approval_handler is not None:
+            return bool(
+                self.approval_handler(self.approval_request(name, args, approval_id=approval_id))
+            )
         try:
             answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
+
+    def approval_request(self, name, args, approval_id=""):
+        return {
+            "approval_id": approval_id,
+            "run_id": getattr(self.current_task_state, "run_id", ""),
+            "session_id": self.session["id"],
+            "workspace_root": str(self.root),
+            "tool_name": name,
+            "arguments": dict(args or {}),
+        }
+
+    def is_tool_preapproved(self, name, args):
+        if self.approval_precheck_handler is None:
+            return False
+        return bool(self.approval_precheck_handler(self.approval_request(name, args)))
 
     @staticmethod
     def parse(raw):
