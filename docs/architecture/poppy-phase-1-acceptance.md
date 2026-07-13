@@ -22,13 +22,14 @@
 - `Poppy.app` Bundle ID：`com.george.poppy`
 - 内置 `poppy-gateway` sidecar，仅监听随机 `127.0.0.1` 端口
 - HTTP/WebSocket 均要求每次启动生成的随机令牌
+- HTTP CORS 仅允许 Tauri 本地应用来源，浏览器预检不会再被 FastAPI 以 405 拒绝
 - DeepSeek API Key 已写入 macOS Keychain，服务名为 `com.george.poppy`
 - 正常退出 Poppy 后，Gateway parent/child 均退出，无残留进程
 - 最终构建位置：`desktop/src-tauri/target/release/bundle/macos/Poppy.app`
 
 ## 自动化检查
 
-- `uv run pytest tests -q`：158 passed，6 warnings
+- `uv run pytest tests -q`：159 passed，6 warnings
 - `uv run ruff check pico tests scripts`：通过
 - `npm run build`：通过
 - `cargo fmt --check && cargo check`：通过

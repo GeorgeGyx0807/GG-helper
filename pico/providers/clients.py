@@ -392,6 +392,8 @@ class AnthropicCompatibleModelClient:
             "max_tokens": max_new_tokens,
             "stream": False,
         }
+        if "api.deepseek.com" in self.base_url:
+            payload["thinking"] = {"type": "disabled"}
         if self.temperature is not None:
             payload["temperature"] = self.temperature
 
@@ -466,6 +468,8 @@ class AnthropicCompatibleModelClient:
             "max_tokens": max_new_tokens,
             "stream": True,
         }
+        if "api.deepseek.com" in self.base_url:
+            payload["thinking"] = {"type": "disabled"}
         if self.temperature is not None:
             payload["temperature"] = self.temperature
 

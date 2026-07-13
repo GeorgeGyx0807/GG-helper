@@ -87,6 +87,8 @@
   - 流式 Provider 在取消时主动关闭响应，避免没有新 token 时停止按钮长时间无响应。
   - 用户已成功将 DeepSeek API Key 写入 macOS Keychain，并完成新构建的钥匙串访问授权。
   - 修复 Keychain 弹窗阻塞启动时前端误回退到开发地址 `127.0.0.1:8765` 的竞态；生产应用现在持续等待 Tauri 返回真实随机端口和令牌。
+  - 用实际 OPTIONS 请求确认 WebKit `Load failed` 的直接原因是 Gateway 返回 405；新增仅允许 Tauri 本地来源的 CORS 中间件和拒绝不可信来源测试。
+  - 真实 Test connection 到达 DeepSeek 后只返回 thinking 块；按 DeepSeek 官方 Anthropic 参数显式关闭 thinking，并将检测输出额度由 16 提升到 64。
 
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
@@ -101,7 +103,7 @@
 | Poppy 最终 Python 回归 | `uv run pytest tests -q` | Runtime/Gateway/权限/附件无回归 | 155 passed，6 warnings | 通过 |
 | Poppy 前端构建 | `npm run build` | TypeScript 和 Vite 构建通过 | 构建成功 | 通过 |
 | Poppy Rust 检查 | `cargo fmt --check && cargo check` | 格式与 Tauri 壳编译通过 | 通过 | 通过 |
-| Poppy 审计后全量回归 | `uv run pytest tests -q` | 授权撤销、流式停止与原有行为无回归 | 158 passed，6 warnings | 通过 |
+| Poppy 审计后全量回归 | `uv run pytest tests -q` | 授权撤销、CORS、DeepSeek thinking、流式停止与原有行为无回归 | 159 passed，6 warnings | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |

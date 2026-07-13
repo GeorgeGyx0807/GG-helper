@@ -152,6 +152,7 @@ def test_anthropic_compatible_client_streams_text_deltas():
     assert text == "<final>OK</final>"
     assert deltas == ["<final>", "OK", "</final>"]
     assert captured["body"]["stream"] is True
+    assert captured["body"]["thinking"] == {"type": "disabled"}
     assert captured["headers"]["Accept"] == "text/event-stream"
     assert client.last_completion_metadata == {
         "input_tokens": 10,

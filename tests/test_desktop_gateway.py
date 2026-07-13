@@ -80,6 +80,31 @@ def test_gateway_requires_connection_token_for_every_http_route(tmp_path):
     }
 
 
+def test_gateway_allows_only_tauri_origins_for_browser_requests(tmp_path):
+    _controller, client, _headers = build_gateway(tmp_path, ["<final>ok</final>"])
+    allowed = client.options(
+        "/health",
+        headers={
+            "Origin": "tauri://localhost",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-pico-token",
+        },
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "tauri://localhost"
+    assert "X-Pico-Token" in allowed.headers["access-control-allow-headers"]
+
+    denied = client.options(
+        "/health",
+        headers={
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert denied.status_code == 400
+    assert "access-control-allow-origin" not in denied.headers
+
+
 def test_gateway_shutdown_route_is_authenticated_and_optional(tmp_path):
     controller, client, headers = build_gateway(tmp_path, ["<final>ok</final>"])
     assert client.post("/shutdown", headers=headers).status_code == 404

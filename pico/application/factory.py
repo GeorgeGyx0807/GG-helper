@@ -58,7 +58,7 @@ class DesktopAgentFactory:
         if not (config.api_key or self.api_key_provider()):
             raise ValueError("DeepSeek API key is not configured")
         client = self._model_client(config)
-        client.complete("Reply with OK only.", max_new_tokens=16)
+        client.complete("Reply with OK only.", max_new_tokens=64)
         return {"status": "ok", "model": config.model}
 
     def _model_client(self, config):

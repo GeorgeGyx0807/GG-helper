@@ -5,6 +5,7 @@ import secrets
 from typing import Dict, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -64,6 +65,17 @@ def create_gateway_app(controller=None, connection_token=None, shutdown_handler=
     controller = controller or DesktopController()
     connection_token = connection_token or generate_connection_token()
     app = FastAPI(title="Poppy Desktop Gateway", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+        ],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "X-Pico-Token"],
+    )
     app.state.controller = controller
     app.state.connection_token = connection_token
 

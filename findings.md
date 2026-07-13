@@ -30,6 +30,7 @@
 - Rust stable 1.97 和 Cargo 1.97 已通过 rustup minimal 安装；Command Line Tools + Rust 的桌面构建前提已满足。
 - Tauri 官方生成器 4.6.2 已创建并完成 `desktop/`：React 19、TypeScript 5.8、Vite 7、Tauri 2，产品名为 Poppy，bundle id 为 `com.george.poppy`。
 - DeepSeek 官方 Anthropic-compatible 入口为 `https://api.deepseek.com/anthropic`；截至 2026-07-13，`deepseek-v4-pro` 可用，旧 `deepseek-chat`/`deepseek-reasoner` 将于 2026-07-24 下线。
+- DeepSeek V4 默认启用 thinking；短连接检测可能只返回 thinking 块而没有最终 text。Poppy 的 `<tool>/<final>` 控制协议明确使用 Anthropic 参数 `thinking: {"type":"disabled"}`，避免把推理预算耗尽或暴露为回答。
 - Tauri 官方支持将外部二进制作为 sidecar 打包，并提供系统托盘和全局快捷键插件；当前实现由 Tauri 启停 PyInstaller Gateway。
 - `keyring` 4.x 的 macOS 后端使用系统 Keychain，并提供删除凭据接口；Poppy 设置页支持写入和移除 DeepSeek API Key。
 - 开发者本地 ad-hoc 重新签名会改变应用代码身份；访问上一构建保存的 Keychain 条目时，macOS 会要求用户重新授权。这不是 API Key 错误，输入的是 Mac 登录密码。
