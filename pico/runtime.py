@@ -194,8 +194,8 @@ class Pico:
         if allowed_tools is None:
             return None
         normalized = tuple(str(name).strip() for name in allowed_tools)
-        if not normalized or any(not name for name in normalized):
-            raise ValueError("allowed_tools must be a non-empty sequence of tool names")
+        if any(not name for name in normalized):
+            raise ValueError("allowed_tools must be a sequence of tool names")
         return normalized
 
     def _apply_tool_allowlist(self, tools):

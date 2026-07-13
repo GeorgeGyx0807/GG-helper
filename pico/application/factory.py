@@ -27,7 +27,7 @@ class DesktopAgentConfig:
     max_steps: int = 6
     max_new_tokens: int = 512
     approval_policy: str = "ask"
-    allowed_tools: tuple = ()
+    allowed_tools: tuple | None = None
 
 
 class DesktopAgentFactory:
@@ -48,7 +48,7 @@ class DesktopAgentFactory:
             "max_steps": config.max_steps,
             "max_new_tokens": config.max_new_tokens,
             "secret_env_names": ("PICO_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"),
-            "allowed_tools": config.allowed_tools or None,
+            "allowed_tools": config.allowed_tools,
         }
         if config.session_id:
             return Pico.from_session(session_id=config.session_id, **kwargs)

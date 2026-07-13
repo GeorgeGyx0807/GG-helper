@@ -33,20 +33,27 @@ class DesktopController:
     def list_sessions(self):
         return self.database.list_sessions()
 
-    def create_session(self, workspace_root, title="New conversation"):
-        grant = self._require_grant(workspace_root)
+    def create_session(self, workspace_root="", title="新对话", session_type="project"):
+        session_type = self._normalize_session_type(session_type)
         settings = self.settings()
-        agent = self._build_agent(workspace_root, grant, settings=settings)
+        if session_type == "chat":
+            workspace_root = ""
+            grant = None
+            agent = self._build_agent(str(self.paths.root), grant, settings=settings, allowed_tools=())
+        else:
+            grant = self._require_grant(workspace_root)
+            agent = self._build_agent(workspace_root, grant, settings=settings)
         with self._lock:
             self._agents[agent.session["id"]] = agent
             self._agent_signatures[agent.session["id"]] = self._configuration_signature(
-                workspace_root, grant, settings
+                workspace_root or str(self.paths.root), grant, settings, session_type
             )
         return self.database.upsert_session(
             agent.session["id"],
-            str(title).strip() or "New conversation",
+            str(title).strip() or "新对话",
             workspace_root,
             created_at=agent.session.get("created_at"),
+            session_type=session_type,
         )
 
     def get_session(self, session_id):
@@ -64,6 +71,17 @@ class DesktopController:
             raise ValueError("session title must not be empty")
         return self.database.rename_session(session_id, title)
 
+    def delete_session(self, session_id):
+        if self.database.get_session(session_id) is None:
+            raise KeyError(f"unknown session: {session_id}")
+        if self.service.has_active_session(session_id):
+            raise RuntimeError("cannot delete a session while it is running")
+        with self._lock:
+            self._agents.pop(session_id, None)
+            self._agent_signatures.pop(session_id, None)
+        self.database.delete_session(session_id)
+        SessionStore(self.paths.sessions).path(session_id).unlink(missing_ok=True)
+
     def start_run(self, session_id, message, attachments=None):
         item = self.database.get_session(session_id)
         if item is None:
@@ -71,7 +89,9 @@ class DesktopController:
         message = str(message).strip()
         if not message:
             raise ValueError("message must not be empty")
-        attachment_paths = self._validate_attachments(item["workspace_root"], attachments or [])
+        attachment_paths = self._validate_attachments(
+            item["workspace_root"], attachments or [], unrestricted=item.get("session_type") == "chat"
+        )
         agent_message = message
         if attachment_paths:
             agent_message += ATTACHMENT_MARKER + "\n".join(f"- {path}" for path in attachment_paths)
@@ -166,29 +186,39 @@ class DesktopController:
         self.service.shutdown()
 
     def _get_agent(self, session_id, item):
-        grant = self._require_grant(item["workspace_root"])
+        session_type = self._normalize_session_type(item.get("session_type", "project"))
+        if session_type == "chat":
+            workspace_root = str(self.paths.root)
+            grant = None
+            allowed_tools = ()
+        else:
+            workspace_root = item["workspace_root"]
+            grant = self._require_grant(workspace_root)
+            allowed_tools = None
         settings = self.settings()
-        signature = self._configuration_signature(item["workspace_root"], grant, settings)
+        signature = self._configuration_signature(workspace_root, grant, settings, session_type)
         with self._lock:
             cached = self._agents.get(session_id)
             cached_signature = self._agent_signatures.get(session_id)
         if cached is not None and cached_signature == signature:
             return cached
         agent = self._build_agent(
-            item["workspace_root"], grant, session_id=session_id, settings=settings
+            workspace_root, grant, session_id=session_id, settings=settings, allowed_tools=allowed_tools
         )
         with self._lock:
             self._agents[session_id] = agent
             self._agent_signatures[session_id] = signature
         return agent
 
-    def _build_agent(self, workspace_root, grant, session_id="", settings=None):
+    def _build_agent(self, workspace_root, grant=None, session_id="", settings=None, allowed_tools=None):
         settings = settings or self.settings()
-        tools = list(READ_TOOLS)
-        if grant["can_write"]:
-            tools.extend(WRITE_TOOLS)
-        if grant["can_shell"]:
-            tools.extend(SHELL_TOOLS)
+        if allowed_tools is None:
+            tools = list(READ_TOOLS)
+            if grant and grant["can_write"]:
+                tools.extend(WRITE_TOOLS)
+            if grant and grant["can_shell"]:
+                tools.extend(SHELL_TOOLS)
+            allowed_tools = tuple(tools)
         config = DesktopAgentConfig(
             workspace_root=str(Path(workspace_root).resolve()),
             session_id=session_id,
@@ -197,19 +227,20 @@ class DesktopController:
             timeout=int(settings["timeout"]),
             max_steps=int(settings.get("max_steps", 6)),
             max_new_tokens=int(settings.get("max_new_tokens", 512)),
-            allowed_tools=tuple(tools),
+            allowed_tools=tuple(allowed_tools),
         )
         agent = self.agent_factory.build(config)
         agent.personal_memory_provider = self._personal_memory_text
         return agent
 
     @staticmethod
-    def _configuration_signature(workspace_root, grant, settings):
+    def _configuration_signature(workspace_root, grant, settings, session_type="project"):
         return (
             str(Path(workspace_root).expanduser().resolve()),
-            bool(grant["can_read"]),
-            bool(grant["can_write"]),
-            bool(grant["can_shell"]),
+            str(session_type),
+            bool(grant and grant["can_read"]),
+            bool(grant and grant["can_write"]),
+            bool(grant and grant["can_shell"]),
             str(settings["model"]),
             str(settings["base_url"]),
             int(settings["timeout"]),
@@ -247,6 +278,13 @@ class DesktopController:
         self.database.add_approval_rule(*descriptor)
         return True
 
+    @staticmethod
+    def _normalize_session_type(session_type):
+        normalized = str(session_type or "project").strip().lower()
+        if normalized not in {"project", "chat"}:
+            raise ValueError("session_type must be project or chat")
+        return normalized
+
     def _require_grant(self, workspace_root):
         resolved = Path(workspace_root).expanduser().resolve()
         grant = self.database.get_grant_by_path(resolved)
@@ -255,14 +293,14 @@ class DesktopController:
         return grant
 
     @staticmethod
-    def _validate_attachments(workspace_root, attachments):
-        root = Path(workspace_root).expanduser().resolve()
+    def _validate_attachments(workspace_root, attachments, unrestricted=False):
+        root = Path(workspace_root).expanduser().resolve() if workspace_root else None
         validated = []
         for raw_path in attachments:
             path = Path(str(raw_path)).expanduser().resolve()
-            if not path.is_file():
-                raise ValueError(f"attachment is not a file: {path}")
-            if not path.is_relative_to(root):
+            if not path.exists() or not (path.is_file() or path.is_dir()):
+                raise ValueError(f"attachment is not an existing file or folder: {path}")
+            if not unrestricted and (root is None or not path.is_relative_to(root)):
                 raise PermissionError(f"attachment is outside the authorized workspace: {path}")
             validated.append(str(path))
         return validated

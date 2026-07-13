@@ -181,6 +181,14 @@ class AssistantService:
         with self._lock:
             return self._require_run(run_id).snapshot()
 
+    def has_active_session(self, session_id):
+        with self._lock:
+            run_id = self._active_sessions.get(session_id)
+            if not run_id:
+                return False
+            run = self._runs.get(run_id)
+            return bool(run and run.status not in TERMINAL_RUN_STATUSES)
+
     def get_events(self, run_id, after_sequence=0):
         with self._lock:
             run = self._require_run(run_id)

@@ -11,6 +11,15 @@ const statusIcon = {
   cancelled: <CircleAlert size={16} />,
 };
 
+const statusText = {
+  requested: "已请求",
+  waiting: "等待确认",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
 export function ToolCard({ tool }: { tool: ToolCall }) {
   const [open, setOpen] = useState(tool.status === "waiting" || tool.status === "failed");
   return (
@@ -19,24 +28,24 @@ export function ToolCard({ tool }: { tool: ToolCall }) {
         <TerminalSquare size={17} />
         <div>
           <strong>{tool.name}</strong>
-          <span>{tool.status === "waiting" ? "Waiting for approval" : tool.status}</span>
+          <span>{statusText[tool.status]}</span>
         </div>
         <div className="tool-status">{statusIcon[tool.status]}</div>
         <ChevronDown className={open ? "rotated" : ""} size={16} />
       </button>
       {open && (
         <div className="tool-details">
-          <div className="detail-label">Arguments</div>
+          <div className="detail-label">参数</div>
           <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>
           {tool.output && (
             <>
-              <div className="detail-label">Output</div>
+              <div className="detail-label">输出</div>
               <pre>{tool.output}</pre>
             </>
           )}
           {!!tool.affectedPaths?.length && (
             <div className="affected-paths">
-              <span className="detail-label">Changed</span>
+              <span className="detail-label">文件变化</span>
               {tool.affectedPaths.map((path) => <code key={path}>{path}</code>)}
             </div>
           )}

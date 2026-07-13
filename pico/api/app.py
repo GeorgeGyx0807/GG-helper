@@ -18,8 +18,9 @@ def generate_connection_token():
 
 
 class SessionCreate(BaseModel):
-    workspace_root: str
-    title: str = "New conversation"
+    workspace_root: Optional[str] = None
+    title: str = "新对话"
+    session_type: str = "project"
 
 
 class SessionUpdate(BaseModel):
@@ -97,6 +98,10 @@ def create_gateway_app(controller=None, connection_token=None, shutdown_handler=
     async def handle_value_error(_request, exc):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(RuntimeError)
+    async def handle_runtime_error(_request, exc):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/health", dependencies=auth)
     def health():
         return {"status": "ok", "service": "poppy-desktop-gateway"}
@@ -107,7 +112,7 @@ def create_gateway_app(controller=None, connection_token=None, shutdown_handler=
 
     @app.post("/sessions", dependencies=auth, status_code=201)
     def create_session(body: SessionCreate):
-        return controller.create_session(body.workspace_root, body.title)
+        return controller.create_session(body.workspace_root or "", body.title, body.session_type)
 
     @app.get("/sessions/{session_id}", dependencies=auth)
     def get_session(session_id: str):
@@ -116,6 +121,10 @@ def create_gateway_app(controller=None, connection_token=None, shutdown_handler=
     @app.patch("/sessions/{session_id}", dependencies=auth)
     def update_session(session_id: str, body: SessionUpdate):
         return controller.rename_session(session_id, body.title)
+
+    @app.delete("/sessions/{session_id}", dependencies=auth, status_code=204)
+    def delete_session(session_id: str):
+        controller.delete_session(session_id)
 
     @app.post("/runs", dependencies=auth, status_code=202)
     def create_run(body: RunCreate):

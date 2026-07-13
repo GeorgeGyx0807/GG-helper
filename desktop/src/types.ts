@@ -2,6 +2,7 @@ export type SessionSummary = {
   id: string;
   title: string;
   workspace_root: string;
+  session_type: "project" | "chat";
   created_at: string;
   updated_at: string;
 };

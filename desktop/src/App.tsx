@@ -2,11 +2,16 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowUp,
+  BrainCircuit,
   Bot,
+  ChevronDown,
   FolderOpen,
   PanelLeftClose,
   PanelLeftOpen,
   Paperclip,
+  Pencil,
+  Plus,
+  Puzzle,
   ShieldCheck,
   Square,
   Sun,
@@ -14,10 +19,11 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
+import poppyMark from "./assets/poppy-mark.svg";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar } from "./components/Sidebar";
 import { ToolCard } from "./components/ToolCard";
@@ -27,6 +33,12 @@ import type { ApprovalRule, Grant, HistoryItem, MemoryItem, RunEvent, SessionSum
 
 type ApprovalPrompt = { approvalId: string; toolName: string; arguments: Record<string, unknown> };
 type RetryRequest = { content: string; attachments: string[] };
+type DraftType = "chat" | "project";
+
+const modelOptions = [
+  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro", note: "高质量" },
+  { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash", note: "更快" },
+];
 
 const defaultSettings: Settings = {
   model: "deepseek-v4-pro",
@@ -39,7 +51,7 @@ function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     const saved = window.localStorage.getItem("poppy-theme");
     if (saved === "dark" || saved === "light") return saved;
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    return "light";
   });
   const [client, setClient] = useState<GatewayClient | null>(null);
   const [connected, setConnected] = useState(false);
@@ -48,6 +60,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
+  const [activeWorkspace, setActiveWorkspace] = useState<string>();
   const [messages, setMessages] = useState<HistoryItem[]>([]);
   const [tools, setTools] = useState<ToolCall[]>([]);
   const [grants, setGrants] = useState<Grant[]>([]);
@@ -62,11 +75,20 @@ function App() {
   const [pendingFolder, setPendingFolder] = useState<string>();
   const [createSessionAfterGrant, setCreateSessionAfterGrant] = useState(false);
   const [choosingWorkspace, setChoosingWorkspace] = useState(false);
+  const [taskDraft, setTaskDraft] = useState(false);
+  const [draftType, setDraftType] = useState<DraftType>("chat");
+  const [composerMenuOpen, setComposerMenuOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [renamingSession, setRenamingSession] = useState<{ id: string; title: string }>();
+  const [renameValue, setRenameValue] = useState("");
   const [lastRequest, setLastRequest] = useState<RetryRequest>();
   const disconnectRef = useRef<(() => void) | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerMenuRef = useRef<HTMLDivElement>(null);
 
   const selected = useMemo(() => sessions.find((session) => session.id === selectedId), [sessions, selectedId]);
+  const activeProjectName = activeWorkspace?.split(/[\\/]/).filter(Boolean).pop() || "项目";
 
   useEffect(() => {
     void initialize();
@@ -82,6 +104,18 @@ function App() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, tools]);
+
+  useEffect(() => {
+    if (!composerMenuOpen) return;
+    const close = (event: MouseEvent) => {
+      if (!composerMenuRef.current?.contains(event.target as Node)) {
+        setComposerMenuOpen(false);
+        setModelMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [composerMenuOpen]);
 
   async function initialize() {
     setLoading(true);
@@ -113,7 +147,7 @@ function App() {
           await new Promise((resolve) => window.setTimeout(resolve, 350));
         }
       }
-      if (!snapshot) throw lastError instanceof Error ? lastError : new Error("Poppy could not load local data");
+      if (!snapshot) throw lastError instanceof Error ? lastError : new Error("Poppy 无法加载本地数据");
       const [sessionList, grantList, appSettings, memoryList, ruleList] = snapshot;
       disconnectRef.current?.();
       setClient(gateway);
@@ -124,6 +158,7 @@ function App() {
       setMemories(memoryList);
       setApprovalRules(ruleList);
       if (sessionList[0]) await selectSession(gateway, sessionList[0].id);
+      else if (grantList[0]) setActiveWorkspace(grantList[0].path);
   }
 
   async function saveApiKey(apiKey: string) {
@@ -136,7 +171,7 @@ function App() {
       setError("");
     } catch (reason) {
       const failure = keyStored
-        ? new Error("The API key was saved, but Poppy could not reconnect. Choose Try again or restart Poppy.")
+        ? new Error("API Key 已保存，但 Poppy 无法重新连接，请重试或重启应用。")
         : reason instanceof Error ? reason : new Error(String(reason));
       setError(failure.message);
       throw failure;
@@ -175,6 +210,8 @@ function App() {
     disconnectRef.current?.();
     const detail = await gateway.session(id);
     setSelectedId(id);
+    setTaskDraft(false);
+    setActiveWorkspace(detail.session_type === "chat" ? undefined : detail.workspace_root);
     setMessages(detail.history.filter((item) => item.role !== "tool"));
     setTools(
       detail.history.filter((item) => item.role === "tool").map((item, index) => ({
@@ -192,10 +229,10 @@ function App() {
     if (!client) return;
     let selectedPath: string | null = null;
     try {
-      const result = await open({ directory: true, multiple: false, title: "Authorize a folder for Poppy" });
+      const result = await open({ directory: true, multiple: false, title: "选择要授权的文件夹" });
       selectedPath = typeof result === "string" ? result : null;
     } catch {
-      selectedPath = window.prompt("Folder path") || null;
+      selectedPath = window.prompt("输入文件夹路径") || null;
     }
     if (!selectedPath) return;
     setCreateSessionAfterGrant(forNewSession);
@@ -207,29 +244,76 @@ function App() {
     try {
       const path = pendingFolder;
       await client.addGrant(path, canWrite, canShell);
+      setActiveWorkspace(path);
       await refreshMeta();
       setPendingFolder(undefined);
-      if (createSessionAfterGrant) {
+      if (createSessionAfterGrant || taskDraft) {
         setCreateSessionAfterGrant(false);
-        await createSession(path);
+        beginProjectTask(path);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
-  async function createSession(workspaceRoot: string) {
-    if (!client) return;
-    const session = await client.createSession(workspaceRoot);
-    setSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
+  function clearTaskDraft(type: DraftType = "chat", workspace?: string) {
+    disconnectRef.current?.();
+    setSelectedId(undefined);
+    setMessages([]);
+    setTools([]);
+    setLastRequest(undefined);
+    setAttachments([]);
+    setInput("");
+    setActiveRun(undefined);
+    setActiveWorkspace(workspace);
+    setDraftType(type);
+    setTaskDraft(true);
     setChoosingWorkspace(false);
-    await selectSession(client, session.id);
   }
 
-  async function newSession() {
+  function newChat() {
+    if (activeRun) {
+      setError("请先停止当前任务，再切换对话。");
+      return;
+    }
+    clearTaskDraft("chat");
+  }
+
+  function beginProjectTask(path: string) {
+    if (activeRun) return;
+    clearTaskDraft("project", path);
+  }
+
+  async function createDraftSession(): Promise<string | undefined> {
+    if (selectedId) return selectedId;
+    if (!client) return;
+    if (!settings.api_key_configured) {
+      setSettingsOpen(true);
+      return undefined;
+    }
+    try {
+      if (draftType === "project" && !activeWorkspace) {
+        setChoosingWorkspace(true);
+        setError("请先选择一个项目文件夹。");
+        return undefined;
+      }
+      const session = draftType === "project"
+        ? await client.createSession(activeWorkspace, "新任务", "project")
+        : await client.createSession(undefined, "新任务", "chat");
+      setSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
+      setTaskDraft(false);
+      await selectSession(client, session.id);
+      return session.id;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return undefined;
+    }
+  }
+
+  function newSession() {
     if (!client) return;
     if (activeRun) {
-      setError("Stop the current task before switching conversations.");
+      setError("请先停止当前任务，再切换对话。");
       return;
     }
     if (!settings.api_key_configured) {
@@ -237,21 +321,37 @@ function App() {
       return;
     }
     if (!grants.length) {
-      await chooseFolder(true);
+      void chooseFolder(true);
+      return;
+    }
+    const projectPath = activeWorkspace || selected?.workspace_root;
+    if (projectPath && grants.some((grant) => grant.path === projectPath)) {
+      beginProjectTask(projectPath);
       return;
     }
     if (grants.length > 1) {
       setChoosingWorkspace(true);
       return;
     }
-    await createSession(grants[0].path);
+    beginProjectTask(grants[0].path);
   }
 
-  async function chooseAttachments() {
+  async function chooseAttachments(directory = false) {
     try {
-      const result = await open({ directory: false, multiple: true, title: "Attach files for Poppy" });
+      const result = await open({ directory, multiple: true, title: directory ? "选择要附加的文件夹" : "选择要附加的文件" });
       const paths = Array.isArray(result) ? result : result ? [result] : [];
       setAttachments((current) => [...new Set([...current, ...paths])]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function chooseModel(model: string) {
+    if (!client) return;
+    try {
+      setSettings(await client.updateSettings({ model }));
+      setModelMenuOpen(false);
+      setComposerMenuOpen(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -303,7 +403,7 @@ function App() {
       });
     } else if (["run.completed", "run.cancelled", "run.failed"].includes(event.event_type)) {
       if (event.event_type === "run.failed") {
-        setError(String(payload.error || "The task failed before Poppy could finish."));
+        setError(String(payload.error || "任务在 Poppy 完成前失败了。"));
       } else if (event.event_type === "run.completed") {
         setLastRequest(undefined);
       }
@@ -312,18 +412,20 @@ function App() {
     }
   }
 
-  async function runMessage(content: string, attached: string[]) {
-    if (!client || !selectedId || activeRun) return;
+  async function runMessage(content: string, attached: string[], targetSessionId?: string) {
+    const sessionId = targetSessionId || selectedId;
+    if (!client || !sessionId || activeRun) return;
     setError("");
     setLastRequest({ content, attachments: attached });
     setMessages((current) => [...current, { role: "user", content, attachments: attached }, { role: "assistant", content: "" }]);
     try {
-      const run = await client.startRun(selectedId, content, attached);
+      const run = await client.startRun(sessionId, content, attached);
       setActiveRun(run.run_id);
       disconnectRef.current = client.connectEvents(run.run_id, handleEvent, async () => {
         setActiveRun(undefined);
+        setTaskDraft(false);
         try {
-          const detail = await client.session(selectedId);
+          const detail = await client.session(sessionId);
           setMessages(detail.history.filter((item) => item.role !== "tool"));
         } catch { /* keep streamed state */ }
       });
@@ -338,9 +440,11 @@ function App() {
     if (!input.trim()) return;
     const content = input.trim();
     const attached = [...attachments];
+    const sessionId = selectedId || (taskDraft ? await createDraftSession() : undefined);
+    if (!sessionId) return;
     setInput("");
     setAttachments([]);
-    await runMessage(content, attached);
+    await runMessage(content, attached, sessionId);
   }
 
   async function retryLastRequest() {
@@ -367,27 +471,78 @@ function App() {
     }
   }
 
-  const canSend = !!client && !!selectedId && !!input.trim() && !activeRun;
+  async function deleteSession(id: string, title: string) {
+    if (!client || activeRun) return;
+    if (!window.confirm(`确定删除对话“${title}”？删除后无法恢复。`)) return;
+    try {
+      await client.deleteSession(id);
+      const remaining = sessions.filter((session) => session.id !== id);
+      setSessions(remaining);
+      if (selectedId === id) {
+        disconnectRef.current?.();
+        setSelectedId(undefined);
+        setMessages([]);
+        setTools([]);
+        setActiveRun(undefined);
+        const nextInProject = remaining.find((session) => session.session_type !== "chat" && session.workspace_root === activeWorkspace);
+        if (nextInProject) await selectSession(client, nextInProject.id);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function openProject(path: string) {
+    if (!client || activeRun) return;
+    setActiveWorkspace(path);
+    const existing = sessions.find((session) => session.workspace_root === path);
+    if (existing) {
+      await selectSession(client, existing.id);
+      return;
+    }
+    beginProjectTask(path);
+  }
+
+  function beginRename(id: string, title: string) {
+    setRenamingSession({ id, title });
+    setRenameValue(title);
+  }
+
+  async function submitRename() {
+    if (!client || !renamingSession) return;
+    const title = renameValue.trim();
+    if (!title || title === renamingSession.title) {
+      setRenamingSession(undefined);
+      return;
+    }
+    try {
+      await client.renameSession(renamingSession.id, title);
+      setRenamingSession(undefined);
+      await refreshMeta();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  const canSend = !!client && !!input.trim() && !activeRun && (!!selectedId || taskDraft);
 
   return (
     <div className="app-shell">
       {sidebarOpen && (
         <Sidebar
           sessions={sessions}
+          chatSessions={sessions.filter((session) => session.session_type === "chat")}
           grants={grants}
           selectedId={selectedId}
+          selectedWorkspace={activeWorkspace}
           busy={!!activeRun}
           onSelect={(id) => client && !activeRun && void selectSession(client, id)}
-          onNew={() => void newSession()}
+          onNew={() => void newChat()}
           onAddFolder={() => void chooseFolder()}
+          onOpenProject={(path) => void openProject(path)}
           onSettings={() => setSettingsOpen(true)}
-          onRename={async (id, currentTitle) => {
-            if (!client) return;
-            const title = window.prompt("Rename conversation", currentTitle)?.trim();
-            if (!title || title === currentTitle) return;
-            await client.renameSession(id, title);
-            await refreshMeta();
-          }}
+          onRename={beginRename}
+          onDelete={(id, title) => void deleteSession(id, title)}
         />
       )}
 
@@ -397,49 +552,67 @@ function App() {
             {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
           </button>
           <div className="conversation-title">
-            <strong>{selected?.title || "Poppy"}</strong>
-            <span>{selected?.workspace_root || "Your private desktop assistant"}</span>
+            <strong>{selected?.title || (activeWorkspace ? `${activeProjectName} 项目` : "Poppy")}</strong>
+            <span>{selected?.session_type === "chat" ? "" : selected?.workspace_root || activeWorkspace || "你的桌面个人助手"}</span>
           </div>
           <button
             className="icon-button theme-toggle"
             onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
-            aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-            title={theme === "dark" ? "Light theme" : "Dark theme"}
+            aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+            title={theme === "dark" ? "浅色模式" : "深色模式"}
           >
             <Sun size={18} />
           </button>
           <div className={`connection-pill ${connected ? "online" : "offline"}`}>
             {connected ? <ShieldCheck size={14} /> : <WifiOff size={14} />}
-            {connected ? "Local gateway" : "Disconnected"}
+            {connected ? "已连接" : "未连接"}
           </div>
         </header>
 
         <div className="conversation" ref={scrollRef}>
           {loading ? (
-            <div className="center-state"><div className="pico-orb pulse">P</div><p>Starting Poppy…</p></div>
+            <div className="center-state"><div className="pico-orb pulse"><img src={poppyMark} alt="Poppy" /></div><p>正在启动 Poppy…</p></div>
           ) : !connected ? (
             <div className="center-state error-state">
               <div className="pico-orb"><WifiOff size={25} /></div>
-              <h2>Gateway unavailable</h2>
-              <p>{error || "Poppy could not connect to its local runtime."}</p>
-              <button className="secondary-button" onClick={() => void initialize()}>Try again</button>
+              <h2>助手暂时不可用</h2>
+              <p>{error || "Poppy 无法连接本地运行服务。"}</p>
+              <button className="secondary-button" onClick={() => void initialize()}>重试</button>
             </div>
           ) : !settings.api_key_configured ? (
             <div className="center-state welcome-state">
-              <div className="pico-orb">P</div>
-              <h1>Connect DeepSeek</h1>
-              <p>Your API key is stored in macOS Keychain and is never written to Poppy's database.</p>
-              <button className="primary-action compact" onClick={() => setSettingsOpen(true)}>Open settings</button>
+              <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+              <h1>连接 DeepSeek</h1>
+              <p>请在设置中填写 DeepSeek API 密钥。密钥只保存在 macOS 钥匙串中。</p>
+              <button className="primary-action compact" onClick={() => setSettingsOpen(true)}>打开设置</button>
             </div>
           ) : !selectedId ? (
-            <div className="center-state welcome-state">
-              <div className="pico-orb">P</div>
-              <h1>How can I help?</h1>
-              <p>Poppy works only inside folders you explicitly authorize.</p>
+            taskDraft ? (
+              <div className="center-state task-state">
+                <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+                <h1>我们开始做什么？</h1>
+                <p>{draftType === "project" && activeWorkspace ? `将在“${activeProjectName}”项目中开始任务` : "描述你想完成的事情，发送后才会创建任务。"}</p>
+                <div className="task-suggestions">
+                  {[
+                    ["探索并理解内容", "帮我梳理这份资料的重点"],
+                    ["构建新功能", "帮我设计并实现一个功能"],
+                    ["审查并提出建议", "请检查这段内容并给出改进建议"],
+                    ["解决问题和失败", "帮我定位这个问题的原因"],
+                  ].map(([title, prompt]) => (
+                    <button key={title} className="task-suggestion" onClick={() => setInput(prompt)}>
+                      <BrainCircuit size={16} /> <span>{title}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : <div className="center-state welcome-state">
+              <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+              <h1>{activeWorkspace ? `在“${activeProjectName}”项目中开始工作` : "今天想做什么？"}</h1>
+              <p>{activeWorkspace ? "新建对话后，Poppy 只会在这个项目文件夹中工作。" : "Poppy 只会访问你明确授权的文件夹。"}</p>
               {!grants.length ? (
-                <button className="primary-action compact" onClick={() => void chooseFolder()}><FolderOpen size={17} /> Authorize a folder</button>
+                <button className="primary-action compact" onClick={() => void chooseFolder()}><FolderOpen size={17} /> 授权一个文件夹</button>
               ) : (
-                <button className="primary-action compact" onClick={() => void newSession()}>Start a conversation</button>
+                <button className="primary-action compact" onClick={newSession}>开始新任务</button>
               )}
             </div>
           ) : (
@@ -448,7 +621,7 @@ function App() {
                 <article className={`message ${message.role}`} key={`${message.created_at || "message"}-${index}`}>
                   <div className="avatar">{message.role === "user" ? <UserRound size={17} /> : <Bot size={18} />}</div>
                   <div className="message-body">
-                    <div className="message-role">{message.role === "user" ? "You" : "Poppy"}</div>
+                    <div className="message-role">{message.role === "user" ? "你" : "Poppy"}</div>
                     {message.role === "assistant" ? (
                       message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <div className="typing"><i /><i /><i /></div>
                     ) : <><p>{message.content}</p>{!!message.attachments?.length && <div className="message-attachments">{message.attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}</span>)}</div>}</>}
@@ -460,30 +633,69 @@ function App() {
           )}
         </div>
 
-        {connected && selectedId && (
+        {connected && (selectedId || taskDraft) && (
           <div className="composer-wrap">
-            {error && <div className="inline-error"><span>{error}</span>{lastRequest && !activeRun && <button onClick={() => void retryLastRequest()}>Retry</button>}</div>}
+            {error && <div className="inline-error"><span>{error}</span>{lastRequest && !activeRun && <button onClick={() => void retryLastRequest()}>重试</button>}</div>}
+            {taskDraft && <div className="draft-context-bar">
+              <button className="draft-context-button" onClick={() => grants.length ? setChoosingWorkspace(true) : void chooseFolder(false)}>
+                <FolderOpen size={14} /> {activeWorkspace ? activeProjectName : "选择项目"}<ChevronDown size={13} />
+              </button>
+              <span>{draftType === "project" ? "项目任务" : "普通任务"}</span>
+            </div>}
             <div className="composer">
-              <div className="composer-input">
-                {!!attachments.length && <div className="composer-attachments">{attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}<button aria-label="Remove attachment" onClick={() => setAttachments((current) => current.filter((item) => item !== path))}><X size={12} /></button></span>)}</div>}
+              <div className="composer-menu-wrap" ref={composerMenuRef}>
+                <button className="composer-plus" onClick={() => { setComposerMenuOpen((open) => !open); setModelMenuOpen(false); }} aria-label="添加"><Plus size={18} /></button>
+                {composerMenuOpen && <div className="composer-menu">
+                  <div className="composer-menu-header"><span className="composer-menu-title">添加</span><button className="composer-menu-close" onClick={() => { setComposerMenuOpen(false); setModelMenuOpen(false); }} aria-label="收起菜单"><ChevronDown size={16} /></button></div>
+                  <button onClick={() => { setComposerMenuOpen(false); void chooseAttachments(false); }}><Paperclip size={15} />选择文件</button>
+                  <button onClick={() => { setComposerMenuOpen(false); void chooseAttachments(true); }}><FolderOpen size={15} />选择文件夹</button>
+                  <button onClick={() => { setComposerMenuOpen(false); setError("插件入口已预留，插件中心将在后续版本接入。"); }}><Puzzle size={15} />插件</button>
+                  <button onClick={() => setModelMenuOpen((open) => !open)}><BrainCircuit size={15} />选择模型 <ChevronDown size={13} /></button>
+                  {modelMenuOpen && <div className="model-menu">
+                    <div className="composer-menu-title">模型</div>
+                    {modelOptions.map((option) => <button key={option.value} className={settings.model === option.value ? "selected" : ""} onClick={() => void chooseModel(option.value)}><span>{option.label}</span><small>{option.note}</small></button>)}
+                  </div>}
+                </div>}
+              </div>
+              <div
+                className={`composer-input ${isDraggingOver ? "dragging" : ""}`}
+                onDragEnter={(event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setIsDraggingOver(true); }}
+                onDragOver={(event: DragEvent<HTMLDivElement>) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setIsDraggingOver(true); }}
+                onDragLeave={(event: DragEvent<HTMLDivElement>) => { if (event.currentTarget === event.target) setIsDraggingOver(false); }}
+                onDrop={(event: DragEvent<HTMLDivElement>) => {
+                  event.preventDefault();
+                  setIsDraggingOver(false);
+                  const paths = Array.from(event.dataTransfer.files)
+                    .map((file) => (file as File & { path?: string }).path || "")
+                    .filter(Boolean);
+                  if (!paths.length) {
+                    setError("没有读取到拖入文件的路径，请从 Finder 或桌面直接拖入。");
+                    return;
+                  }
+                  setAttachments((current) => [...new Set([...current, ...paths])]);
+                }}
+              >
+                {!!attachments.length && <div className="composer-attachments">{attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}<button aria-label="移除附件" onClick={() => setAttachments((current) => current.filter((item) => item !== path))}><X size={12} /></button></span>)}</div>}
                 <textarea
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); }
                   }}
-                  placeholder="Ask Poppy to read, explain, or change something…"
+                  placeholder="输入消息…"
                   rows={1}
                 />
               </div>
-              <button className="composer-tool" onClick={() => void chooseAttachments()} aria-label="Attach files"><Paperclip size={17} /></button>
+              <button className="composer-model-label" onClick={() => { setComposerMenuOpen(true); setModelMenuOpen(true); }} aria-label="选择模型">
+                {modelOptions.find((option) => option.value === settings.model)?.label || settings.model}
+                <ChevronDown size={13} />
+              </button>
               {activeRun ? (
-                <button className="send-button stop" onClick={() => void cancelActiveRun()} aria-label="Stop"><Square size={15} fill="currentColor" /></button>
+                <button className="send-button stop" onClick={() => void cancelActiveRun()} aria-label="停止生成"><Square size={15} fill="currentColor" /></button>
               ) : (
-                <button className="send-button" disabled={!canSend} onClick={() => void sendMessage()} aria-label="Send"><ArrowUp size={19} /></button>
+                <button className="send-button" disabled={!canSend} onClick={() => void sendMessage()} aria-label="发送"><ArrowUp size={19} /></button>
               )}
             </div>
-            <span className="composer-hint">Poppy may make mistakes. Risky actions always require approval.</span>
           </div>
         )}
       </main>
@@ -492,13 +704,13 @@ function App() {
         <div className="approval-backdrop">
           <section className="approval-dialog">
             <div className="approval-icon"><ShieldCheck size={24} /></div>
-            <h2>Allow this action?</h2>
-            <p>Poppy wants to run <strong>{approval.toolName}</strong>.</p>
+            <h2>允许执行这个操作吗？</h2>
+            <p>Poppy 请求运行 <strong>{approval.toolName}</strong>。</p>
             <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
             <div className="approval-actions">
-              <button className="ghost-button" onClick={() => void resolveApproval("deny")}>Deny</button>
-              {approval.toolName !== "run_shell" && <button className="secondary-button" onClick={() => void resolveApproval("allow_always")}>Always allow this file</button>}
-              <button className="primary-button" onClick={() => void resolveApproval("allow_once")}>Allow once</button>
+              <button className="ghost-button" onClick={() => void resolveApproval("deny")}>拒绝</button>
+              {approval.toolName !== "run_shell" && <button className="secondary-button" onClick={() => void resolveApproval("allow_always")}>始终允许此文件</button>}
+              <button className="primary-button" onClick={() => void resolveApproval("allow_once")}>本次允许</button>
             </div>
           </section>
         </div>
@@ -508,14 +720,14 @@ function App() {
         <div className="approval-backdrop">
           <section className="approval-dialog folder-dialog">
             <div className="approval-icon"><FolderOpen size={24} /></div>
-            <h2>Authorize this folder?</h2>
-            <p>Choose exactly what Poppy may do inside this folder.</p>
+            <h2>授权这个文件夹？</h2>
+            <p>请选择 Poppy 在这个文件夹中可以执行的操作。</p>
             <pre>{pendingFolder}</pre>
             <div className="folder-permission-actions">
-              <button className="ghost-button" onClick={() => { setPendingFolder(undefined); setCreateSessionAfterGrant(false); }}>Cancel</button>
-              <button className="secondary-button" onClick={() => void authorizeFolder(false, false)}>Read only</button>
-              <button className="secondary-button" onClick={() => void authorizeFolder(true, false)}>Read &amp; write</button>
-              <button className="primary-button" onClick={() => void authorizeFolder(true, true)}>Write + Shell</button>
+              <button className="ghost-button" onClick={() => { setPendingFolder(undefined); setCreateSessionAfterGrant(false); }}>取消</button>
+              <button className="secondary-button" onClick={() => void authorizeFolder(false, false)}>仅阅读</button>
+              <button className="secondary-button" onClick={() => void authorizeFolder(true, false)}>读写</button>
+              <button className="primary-button" onClick={() => void authorizeFolder(true, true)}>读写 + 终端</button>
             </div>
           </section>
         </div>
@@ -525,17 +737,41 @@ function App() {
         <div className="approval-backdrop">
           <section className="approval-dialog folder-dialog">
             <div className="approval-icon"><FolderOpen size={24} /></div>
-            <h2>Choose a workspace</h2>
-            <p>Each conversation is limited to one authorized folder.</p>
+            <h2>选择项目</h2>
+            <p>新对话会在你选择的项目文件夹中工作。</p>
             <div className="workspace-choice-list">
               {grants.map((grant) => (
-                <button className="workspace-choice" key={grant.id} onClick={() => void createSession(grant.path)}>
+                <button className="workspace-choice" key={grant.id} onClick={() => beginProjectTask(grant.path)}>
                   <strong>{grant.path.split("/").pop()}</strong>
                   <span>{grant.path}</span>
                 </button>
               ))}
             </div>
-            <div className="approval-actions"><button className="ghost-button" onClick={() => setChoosingWorkspace(false)}>Cancel</button></div>
+            <div className="approval-actions"><button className="ghost-button" onClick={() => setChoosingWorkspace(false)}>取消</button></div>
+          </section>
+        </div>
+      )}
+
+      {renamingSession && (
+        <div className="approval-backdrop" onMouseDown={() => setRenamingSession(undefined)}>
+          <section className="approval-dialog rename-dialog" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="approval-icon"><Pencil size={22} /></div>
+            <h2>重命名对话</h2>
+            <p>给这条对话设置一个容易识别的名称。</p>
+            <input
+              className="rename-input"
+              value={renameValue}
+              autoFocus
+              onChange={(event) => setRenameValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") { event.preventDefault(); void submitRename(); }
+                if (event.key === "Escape") setRenamingSession(undefined);
+              }}
+            />
+            <div className="approval-actions">
+              <button className="ghost-button" onClick={() => setRenamingSession(undefined)}>取消</button>
+              <button className="primary-button" disabled={!renameValue.trim()} onClick={() => void submitRename()}>保存</button>
+            </div>
           </section>
         </div>
       )}
@@ -551,7 +787,7 @@ function App() {
           onSaveApiKey={saveApiKey}
           onDeleteApiKey={deleteApiKey}
           onTestConnection={async () => {
-            if (!client) throw new Error("Poppy local gateway is unavailable");
+            if (!client) throw new Error("Poppy 本地服务不可用");
             return client.testConnection();
           }}
           onAddFolder={() => void chooseFolder()}

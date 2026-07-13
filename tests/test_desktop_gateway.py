@@ -190,6 +190,30 @@ def test_gateway_blocks_session_outside_grants_and_limits_tools(tmp_path):
     assert set(agent.tools) == {"list_files", "read_file", "search", "delegate"}
 
 
+def test_gateway_creates_unscoped_chat_session_without_project_grant(tmp_path):
+    attachment = tmp_path / "reference.md"
+    attachment.write_text("reference", encoding="utf-8")
+    controller, client, headers = build_gateway(tmp_path, ["<final>好的，我是 Poppy。</final>"])
+
+    response = client.post(
+        "/sessions",
+        headers=headers,
+        json={"title": "日常问题", "session_type": "chat"},
+    )
+    assert response.status_code == 201
+    session = response.json()
+    assert session["session_type"] == "chat"
+    assert session["workspace_root"] == ""
+    assert controller._agents[session["id"]].tools == {}
+
+    run = client.post(
+        "/runs",
+        headers=headers,
+        json={"session_id": session["id"], "message": "你是谁？", "attachments": [str(attachment)]},
+    ).json()
+    assert wait_for_terminal(client, headers, run["run_id"])["answer"] == "好的，我是 Poppy。"
+
+
 def test_revoking_a_grant_blocks_new_runs_but_preserves_saved_history(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -278,6 +302,24 @@ def test_gateway_renames_and_restores_session_history(tmp_path):
     restored = client.get(f"/sessions/{session['id']}", headers=headers).json()
     assert restored["title"] == "Renamed"
     assert [item["role"] for item in restored["history"]][-2:] == ["user", "assistant"]
+
+
+def test_gateway_deletes_session_and_saved_history(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _controller, client, headers = build_gateway(tmp_path, ["<final>unused</final>"])
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "待删除"},
+    ).json()
+
+    deleted = client.delete(f"/sessions/{session['id']}", headers=headers)
+
+    assert deleted.status_code == 204
+    assert client.get(f"/sessions/{session['id']}", headers=headers).status_code == 404
+    assert all(item["id"] != session["id"] for item in client.get("/sessions", headers=headers).json())
 
 
 def test_gateway_settings_grants_and_memory_crud(tmp_path):

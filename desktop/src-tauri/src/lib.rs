@@ -241,7 +241,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().expect("Poppy app icon").clone())
-                .tooltip("Poppy personal assistant")
+                .tooltip("Poppy 桌面个人助手")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {

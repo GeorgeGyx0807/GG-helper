@@ -29,6 +29,7 @@ class DesktopDatabase:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     workspace_root TEXT NOT NULL,
+                    session_type TEXT NOT NULL DEFAULT 'project',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -63,20 +64,41 @@ class DesktopDatabase:
                 );
                 """
             )
+            session_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "session_type" not in session_columns:
+                self.connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'project'"
+                )
+            # 早期版本的默认标题是英文，首次打开新版时统一为中文。
+            self.connection.execute(
+                "UPDATE sessions SET title = ? WHERE title = ?",
+                ("新对话", "New conversation"),
+            )
 
-    def upsert_session(self, session_id, title, workspace_root, created_at=None):
+    def upsert_session(self, session_id, title, workspace_root, created_at=None, session_type="project"):
         timestamp = utc_now()
+        title = str(title).strip() or "新对话"
+        if title == "New conversation":
+            title = "新对话"
+        session_type = str(session_type).strip().lower() or "project"
+        if session_type not in {"project", "chat"}:
+            raise ValueError("invalid session type")
+        resolved_root = str(Path(workspace_root).expanduser().resolve()) if workspace_root else ""
         with self.lock, self.connection:
             self.connection.execute(
                 """
-                INSERT INTO sessions(id, title, workspace_root, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions(id, title, workspace_root, session_type, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title,
                     workspace_root=excluded.workspace_root,
+                    session_type=excluded.session_type,
                     updated_at=excluded.updated_at
                 """,
-                (session_id, title, str(Path(workspace_root).resolve()), created_at or timestamp, timestamp),
+                (session_id, title, resolved_root, session_type, created_at or timestamp, timestamp),
             )
         return self.get_session(session_id)
 
@@ -95,6 +117,12 @@ class DesktopDatabase:
         if cursor.rowcount == 0:
             raise KeyError(f"unknown session: {session_id}")
         return self.get_session(session_id)
+
+    def delete_session(self, session_id):
+        with self.lock, self.connection:
+            cursor = self.connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        if cursor.rowcount == 0:
+            raise KeyError(f"unknown session: {session_id}")
 
     def set_setting(self, key, value):
         encoded = json.dumps(value, ensure_ascii=False)

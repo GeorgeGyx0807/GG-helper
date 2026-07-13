@@ -82,10 +82,10 @@ export class GatewayClient {
     return this.request<SessionDetail>(`/sessions/${id}`);
   }
 
-  createSession(workspace_root: string, title = "New conversation") {
+  createSession(workspace_root?: string, title = "新对话", session_type: "project" | "chat" = "project") {
     return this.request<SessionSummary>("/sessions", {
       method: "POST",
-      body: JSON.stringify({ workspace_root, title }),
+      body: JSON.stringify({ workspace_root: workspace_root || null, title, session_type }),
     });
   }
 
@@ -94,6 +94,10 @@ export class GatewayClient {
       method: "PATCH",
       body: JSON.stringify({ title }),
     });
+  }
+
+  deleteSession(id: string) {
+    return this.request<void>(`/sessions/${id}`, { method: "DELETE" });
   }
 
   startRun(session_id: string, message: string, attachments: string[] = []) {

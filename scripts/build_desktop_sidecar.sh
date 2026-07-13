@@ -7,7 +7,7 @@ BUILD_ROOT=${TMPDIR:-/tmp}/pico-sidecar-build
 DEST="$ROOT/desktop/src-tauri/binaries/poppy-gateway-$TARGET"
 
 mkdir -p "$ROOT/desktop/src-tauri/binaries" "$BUILD_ROOT/dist" "$BUILD_ROOT/work" "$BUILD_ROOT/spec"
-uv run pyinstaller \
+uv run python -m PyInstaller \
   --noconfirm \
   --clean \
   --onefile \

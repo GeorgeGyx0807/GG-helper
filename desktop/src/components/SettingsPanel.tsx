@@ -58,25 +58,25 @@ export function SettingsPanel(props: Props) {
     <div className="settings-backdrop" onMouseDown={props.onClose}>
       <section className="settings-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header>
-          <div><h2>Settings</h2><p>Models, permissions, and personal memory.</p></div>
+          <div><h2>设置</h2><p>模型、权限和个人记忆</p></div>
           <button className="icon-button" onClick={props.onClose}><X size={18} /></button>
         </header>
 
         <div className="settings-content">
           <div className="settings-group">
             <h3>DeepSeek</h3>
-            <label>Model<input value={model} onChange={(e) => setModel(e.target.value)} /></label>
-            <label>API base URL<input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></label>
-            <label>Timeout (seconds)<input type="number" value={timeout} onChange={(e) => setTimeoutValue(Number(e.target.value))} /></label>
-            <button className="secondary-button" onClick={() => props.onSaveSettings({ model, base_url: baseUrl, timeout })}>Save model settings</button>
+            <label><span>模型</span><input className="settings-field" value={model} onChange={(e) => setModel(e.target.value)} /></label>
+            <label><span>API 地址</span><input className="settings-field" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></label>
+            <label><span>超时时间（秒）</span><input className="settings-field" type="number" value={timeout} onChange={(e) => setTimeoutValue(Number(e.target.value))} /></label>
+            <button className="secondary-button" onClick={() => props.onSaveSettings({ model, base_url: baseUrl, timeout })}>保存模型设置</button>
             <div className="key-row">
               <KeyRound size={17} />
-              <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={props.settings.api_key_configured ? "API key configured" : "Enter DeepSeek API key"} />
-              <button onClick={saveKey} disabled={!apiKey.trim() || savingKey}>{savingKey ? "Saving…" : "Save key"}</button>
+              <input className="settings-field" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={props.settings.api_key_configured ? "API 密钥已配置" : "输入 DeepSeek API 密钥"} />
+              <button onClick={saveKey} disabled={!apiKey.trim() || savingKey}>{savingKey ? "保存中…" : "保存密钥"}</button>
             </div>
             {props.settings.api_key_configured && (
               <div className="key-actions">
-                <span>API key stored in macOS Keychain.</span>
+                <span>API 密钥已保存在 macOS 钥匙串中。</span>
                 <button
                   className="secondary-button"
                   disabled={testingConnection}
@@ -86,14 +86,14 @@ export function SettingsPanel(props: Props) {
                     setConnectionStatus("");
                     try {
                       const result = await props.onTestConnection();
-                      setConnectionStatus(`Connected to ${result.model}`);
+                      setConnectionStatus(`已连接到 ${result.model}`);
                     } catch (reason) {
                       setKeyError(reason instanceof Error ? reason.message : String(reason));
                     } finally {
                       setTestingConnection(false);
                     }
                   }}
-                >{testingConnection ? "Testing…" : "Test connection"}</button>
+                >{testingConnection ? "测试中…" : "测试连接"}</button>
                 <button
                   className="text-danger-button"
                   disabled={deletingKey}
@@ -110,7 +110,7 @@ export function SettingsPanel(props: Props) {
                     }
                   }}
                 >
-                  <Trash2 size={15} /> {deletingKey ? "Removing…" : "Remove key"}
+                  <Trash2 size={15} /> {deletingKey ? "移除中…" : "移除密钥"}
                 </button>
               </div>
             )}
@@ -119,11 +119,11 @@ export function SettingsPanel(props: Props) {
           </div>
 
           <div className="settings-group">
-            <div className="group-heading"><div><h3>Authorized folders</h3><p>Poppy can only access folders listed here.</p></div><button className="icon-button" onClick={props.onAddFolder}><Plus size={17} /></button></div>
+            <div className="group-heading"><div><h3>已授权文件夹</h3><p>Poppy 只能访问列在这里的文件夹。</p></div><button className="icon-button" onClick={props.onAddFolder} aria-label="添加文件夹"><Plus size={17} /></button></div>
             <div className="settings-list">
               {props.grants.map((grant) => (
                 <div className="settings-list-item" key={grant.id}>
-                  <div><strong>{grant.path.split("/").pop()}</strong><span>{grant.path}</span><small>{grant.can_write ? "Read & write" : "Read only"}{grant.can_shell ? " · Shell" : ""}</small></div>
+                  <div><strong>{grant.path.split("/").pop()}</strong><span>{grant.path}</span><small>{grant.can_write ? "读写" : "仅阅读"}{grant.can_shell ? " · 终端" : ""}</small></div>
                   <button className="icon-button danger" onClick={() => props.onDeleteGrant(grant.id)}><Trash2 size={16} /></button>
                 </div>
               ))}
@@ -131,10 +131,10 @@ export function SettingsPanel(props: Props) {
           </div>
 
           <div className="settings-group">
-            <div className="group-heading"><div><h3>Personal memory</h3><p>Visible, editable facts Poppy may recall.</p></div></div>
+            <div className="group-heading"><div><h3>个人记忆</h3><p>Poppy 可以记住的可见、可编辑信息。</p></div></div>
             <form className="memory-form" onSubmit={async (event) => { event.preventDefault(); if (memory.trim()) { await props.onAddMemory(memory); setMemory(""); } }}>
-              <input value={memory} onChange={(e) => setMemory(e.target.value)} placeholder="e.g. Prefer concise Chinese answers" />
-              <button disabled={!memory.trim()}><Plus size={16} /> Add</button>
+              <input className="settings-field" value={memory} onChange={(e) => setMemory(e.target.value)} placeholder="例如：用简洁的中文回答" />
+              <button disabled={!memory.trim()}><Plus size={16} /> 添加</button>
             </form>
             <div className="settings-list">
               {props.memories.map((item) => (
@@ -144,11 +144,11 @@ export function SettingsPanel(props: Props) {
                   ) : <span>{item.content}</span>}</div>
                   <div className="item-actions">
                     {editingMemory === item.id ? (
-                      <button className="icon-button" aria-label="Save memory" onClick={async () => { if (editingContent.trim()) await props.onUpdateMemory(item.id, editingContent.trim()); setEditingMemory(undefined); }}><Check size={16} /></button>
+                      <button className="icon-button" aria-label="保存记忆" onClick={async () => { if (editingContent.trim()) await props.onUpdateMemory(item.id, editingContent.trim()); setEditingMemory(undefined); }}><Check size={16} /></button>
                     ) : (
-                      <button className="icon-button" aria-label="Edit memory" onClick={() => { setEditingMemory(item.id); setEditingContent(item.content); }}><Pencil size={15} /></button>
+                      <button className="icon-button" aria-label="编辑记忆" onClick={() => { setEditingMemory(item.id); setEditingContent(item.content); }}><Pencil size={15} /></button>
                     )}
-                    <button className="icon-button danger" aria-label="Delete memory" onClick={() => props.onDeleteMemory(item.id)}><Trash2 size={16} /></button>
+                    <button className="icon-button danger" aria-label="删除记忆" onClick={() => props.onDeleteMemory(item.id)}><Trash2 size={16} /></button>
                   </div>
                 </div>
               ))}
@@ -156,15 +156,15 @@ export function SettingsPanel(props: Props) {
           </div>
 
           <div className="settings-group">
-            <div className="group-heading"><div><h3>Always-allow rules</h3><p>Rules are limited to one tool and one exact file.</p></div></div>
+            <div className="group-heading"><div><h3>始终允许规则</h3><p>规则仅限一个工具和一个确切文件。</p></div></div>
             <div className="settings-list">
               {props.approvalRules.map((rule) => (
                 <div className="settings-list-item" key={rule.id}>
                   <div><strong>{rule.tool_name}</strong><span>{rule.path_scope}</span><small>{rule.operation}</small></div>
-                  <button className="icon-button danger" aria-label="Delete approval rule" onClick={() => props.onDeleteApprovalRule(rule.id)}><Trash2 size={16} /></button>
+                  <button className="icon-button danger" aria-label="删除允许规则" onClick={() => props.onDeleteApprovalRule(rule.id)}><Trash2 size={16} /></button>
                 </div>
               ))}
-              {!props.approvalRules.length && <p className="empty-copy">No permanent approval rules.</p>}
+              {!props.approvalRules.length && <p className="empty-copy">暂无永久允许规则。</p>}
             </div>
           </div>
         </div>
