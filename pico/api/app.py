@@ -138,6 +138,15 @@ def create_gateway_app(controller=None, connection_token=None, shutdown_handler=
         }
         return controller.update_settings(values)
 
+    @app.post("/settings/test-connection", dependencies=auth)
+    def test_model_connection():
+        try:
+            return controller.test_model_connection()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/grants", dependencies=auth)
     def list_grants():
         return controller.list_grants()

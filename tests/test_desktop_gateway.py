@@ -32,6 +32,9 @@ class FakeDesktopAgentFactory:
             return Pico.from_session(session_id=config.session_id, **kwargs)
         return Pico(**kwargs)
 
+    def test_connection(self, config):
+        return {"status": "ok", "model": config.model}
+
 
 def build_gateway(tmp_path, outputs):
     data_root = tmp_path / "app-data"
@@ -162,6 +165,67 @@ def test_gateway_blocks_session_outside_grants_and_limits_tools(tmp_path):
     assert set(agent.tools) == {"list_files", "read_file", "search", "delegate"}
 
 
+def test_revoking_a_grant_blocks_new_runs_but_preserves_saved_history(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _controller, client, headers = build_gateway(tmp_path, ["<final>Saved.</final>"])
+    grant = client.post(
+        "/grants", headers=headers, json={"path": str(workspace), "can_read": True}
+    ).json()
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "Revoked"},
+    ).json()
+    run = client.post(
+        "/runs", headers=headers, json={"session_id": session["id"], "message": "Save this"}
+    ).json()
+    wait_for_terminal(client, headers, run["run_id"])
+
+    assert client.delete(f"/grants/{grant['id']}", headers=headers).status_code == 204
+    restored = client.get(f"/sessions/{session['id']}", headers=headers)
+    assert restored.status_code == 200
+    assert restored.json()["history"][-1]["content"] == "Saved."
+    denied = client.post(
+        "/runs", headers=headers, json={"session_id": session["id"], "message": "Try again"}
+    )
+    assert denied.status_code == 403
+
+
+def test_downgrading_a_grant_rebuilds_agent_without_write_tools(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outputs = [
+        '<tool>{"name":"write_file","args":{"path":"blocked.txt","content":"no"}}</tool>',
+        "<final>Write was unavailable.</final>",
+    ]
+    controller, client, headers = build_gateway(tmp_path, outputs)
+    client.post(
+        "/grants",
+        headers=headers,
+        json={"path": str(workspace), "can_read": True, "can_write": True},
+    )
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "Downgrade"},
+    ).json()
+    client.post(
+        "/grants",
+        headers=headers,
+        json={"path": str(workspace), "can_read": True, "can_write": False},
+    )
+
+    run = client.post(
+        "/runs", headers=headers, json={"session_id": session["id"], "message": "Write"}
+    ).json()
+    assert wait_for_terminal(client, headers, run["run_id"])["status"] == "completed"
+    assert not (workspace / "blocked.txt").exists()
+    assert set(controller._agents[session["id"]].tools) == {
+        "list_files", "read_file", "search", "delegate"
+    }
+
+
 def test_gateway_renames_and_restores_session_history(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -204,6 +268,10 @@ def test_gateway_settings_grants_and_memory_crud(tmp_path):
     assert settings["model"] == "deepseek-custom"
     assert settings["timeout"] == 120
     assert settings["api_key_configured"] is True
+    assert client.post("/settings/test-connection", headers=headers).json() == {
+        "status": "ok",
+        "model": "deepseek-custom",
+    }
 
     grant = client.post(
         "/grants",

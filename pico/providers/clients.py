@@ -483,8 +483,12 @@ class AnthropicCompatibleModelClient:
         attempts = 3
         for attempt in range(attempts):
             token.raise_if_cancelled()
+            unregister_cancel = None
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    close_response = getattr(response, "close", None)
+                    if callable(close_response):
+                        unregister_cancel = token.add_cancel_callback(close_response)
                     text_parts = []
                     input_tokens = None
                     output_tokens = None
@@ -542,3 +546,10 @@ class AnthropicCompatibleModelClient:
                     f"Base URL: {self.base_url}\n"
                     f"Model: {self.model}"
                 ) from exc
+            except OSError as exc:
+                if token.cancelled:
+                    token.raise_if_cancelled()
+                raise RuntimeError(f"Anthropic-compatible stream failed: {exc}") from exc
+            finally:
+                if unregister_cancel is not None:
+                    unregister_cancel()

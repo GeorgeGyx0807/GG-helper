@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Lock
 
 from ..runtime import SECRET_SHAPED_TEXT_PATTERN
+from ..session_store import SessionStore
 from ..storage import AppPaths, DesktopDatabase
 from .factory import DesktopAgentConfig, DesktopAgentFactory
 from .service import AssistantService
@@ -26,6 +27,7 @@ class DesktopController:
             approval_rule_saver=self._save_approval_rule,
         )
         self._agents = {}
+        self._agent_signatures = {}
         self._lock = Lock()
 
     def list_sessions(self):
@@ -33,9 +35,13 @@ class DesktopController:
 
     def create_session(self, workspace_root, title="New conversation"):
         grant = self._require_grant(workspace_root)
-        agent = self._build_agent(workspace_root, grant)
+        settings = self.settings()
+        agent = self._build_agent(workspace_root, grant, settings=settings)
         with self._lock:
             self._agents[agent.session["id"]] = agent
+            self._agent_signatures[agent.session["id"]] = self._configuration_signature(
+                workspace_root, grant, settings
+            )
         return self.database.upsert_session(
             agent.session["id"],
             str(title).strip() or "New conversation",
@@ -47,8 +53,10 @@ class DesktopController:
         item = self.database.get_session(session_id)
         if item is None:
             raise KeyError(f"unknown session: {session_id}")
-        agent = self._get_agent(session_id, item)
-        return {**item, "history": self._desktop_history(agent.session.get("history", []))}
+        with self._lock:
+            cached = self._agents.get(session_id)
+        session = cached.session if cached is not None else SessionStore(self.paths.sessions).load(session_id)
+        return {**item, "history": self._desktop_history(session.get("history", []))}
 
     def rename_session(self, session_id, title):
         title = str(title).strip()
@@ -98,6 +106,18 @@ class DesktopController:
                 self.database.set_setting(key, value)
         return self.settings()
 
+    def test_model_connection(self):
+        settings = self.settings()
+        config = DesktopAgentConfig(
+            workspace_root=str(self.paths.root),
+            model=settings["model"],
+            base_url=settings["base_url"],
+            timeout=int(settings["timeout"]),
+            max_steps=int(settings.get("max_steps", 6)),
+            max_new_tokens=int(settings.get("max_new_tokens", 512)),
+        )
+        return self.agent_factory.test_connection(config)
+
     def add_grant(self, path, can_read=True, can_write=False, can_shell=False):
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_dir():
@@ -146,18 +166,24 @@ class DesktopController:
         self.service.shutdown()
 
     def _get_agent(self, session_id, item):
+        grant = self._require_grant(item["workspace_root"])
+        settings = self.settings()
+        signature = self._configuration_signature(item["workspace_root"], grant, settings)
         with self._lock:
             cached = self._agents.get(session_id)
-        if cached is not None:
+            cached_signature = self._agent_signatures.get(session_id)
+        if cached is not None and cached_signature == signature:
             return cached
-        grant = self._require_grant(item["workspace_root"])
-        agent = self._build_agent(item["workspace_root"], grant, session_id=session_id)
+        agent = self._build_agent(
+            item["workspace_root"], grant, session_id=session_id, settings=settings
+        )
         with self._lock:
             self._agents[session_id] = agent
+            self._agent_signatures[session_id] = signature
         return agent
 
-    def _build_agent(self, workspace_root, grant, session_id=""):
-        settings = self.settings()
+    def _build_agent(self, workspace_root, grant, session_id="", settings=None):
+        settings = settings or self.settings()
         tools = list(READ_TOOLS)
         if grant["can_write"]:
             tools.extend(WRITE_TOOLS)
@@ -176,6 +202,20 @@ class DesktopController:
         agent = self.agent_factory.build(config)
         agent.personal_memory_provider = self._personal_memory_text
         return agent
+
+    @staticmethod
+    def _configuration_signature(workspace_root, grant, settings):
+        return (
+            str(Path(workspace_root).expanduser().resolve()),
+            bool(grant["can_read"]),
+            bool(grant["can_write"]),
+            bool(grant["can_shell"]),
+            str(settings["model"]),
+            str(settings["base_url"]),
+            int(settings["timeout"]),
+            int(settings.get("max_steps", 6)),
+            int(settings.get("max_new_tokens", 512)),
+        )
 
     def _personal_memory_text(self):
         rows = self.database.list_memories()

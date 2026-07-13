@@ -1,4 +1,5 @@
 import json
+from threading import Event, Thread
 from unittest.mock import patch
 
 import pytest
@@ -191,6 +192,53 @@ def test_anthropic_stream_honors_cancellation_between_deltas():
     with patch("urllib.request.urlopen", return_value=FakeResponse()):
         with pytest.raises(RunCancelled):
             client.complete_stream("hello", 42, cancel_after_first, cancellation_token=token)
+
+
+def test_anthropic_stream_cancel_closes_a_stalled_response():
+    entered = Event()
+    closed = Event()
+    outcome = []
+
+    class StalledResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            entered.set()
+            closed.wait(5)
+            return iter(())
+
+        def close(self):
+            closed.set()
+
+    client = AnthropicCompatibleModelClient(
+        model="deepseek-test",
+        base_url="https://api.deepseek.com/anthropic",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    token = CancellationToken()
+
+    def run_stream():
+        try:
+            client.complete_stream("hello", 42, lambda _delta: None, cancellation_token=token)
+        except Exception as exc:
+            outcome.append(exc)
+
+    with patch("urllib.request.urlopen", return_value=StalledResponse()):
+        thread = Thread(target=run_stream)
+        thread.start()
+        assert entered.wait(1)
+        token.cancel()
+        thread.join(1)
+
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], RunCancelled)
 
 
 def test_runtime_suppresses_streamed_tool_protocol_from_visible_events(tmp_path):

@@ -37,13 +37,7 @@ class DesktopAgentFactory:
 
     def build(self, config):
         workspace = WorkspaceContext.build(config.workspace_root)
-        model_client = AnthropicCompatibleModelClient(
-            model=config.model,
-            base_url=config.base_url,
-            api_key=config.api_key or self.api_key_provider(),
-            temperature=config.temperature,
-            timeout=config.timeout,
-        )
+        model_client = self._model_client(config)
         session_store = SessionStore(self.paths.sessions)
         kwargs = {
             "model_client": model_client,
@@ -59,3 +53,19 @@ class DesktopAgentFactory:
         if config.session_id:
             return Pico.from_session(session_id=config.session_id, **kwargs)
         return Pico(**kwargs)
+
+    def test_connection(self, config):
+        if not (config.api_key or self.api_key_provider()):
+            raise ValueError("DeepSeek API key is not configured")
+        client = self._model_client(config)
+        client.complete("Reply with OK only.", max_new_tokens=16)
+        return {"status": "ok", "model": config.model}
+
+    def _model_client(self, config):
+        return AnthropicCompatibleModelClient(
+            model=config.model,
+            base_url=config.base_url,
+            api_key=config.api_key or self.api_key_provider(),
+            temperature=config.temperature,
+            timeout=config.timeout,
+        )

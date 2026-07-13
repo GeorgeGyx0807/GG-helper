@@ -11,6 +11,7 @@ type Props = {
   onSaveSettings: (values: Partial<Settings>) => Promise<void>;
   onSaveApiKey: (apiKey: string) => Promise<void>;
   onDeleteApiKey: () => Promise<void>;
+  onTestConnection: () => Promise<{ status: string; model: string }>;
   onAddFolder: () => void;
   onDeleteGrant: (id: string) => Promise<void>;
   onAddMemory: (content: string) => Promise<void>;
@@ -27,6 +28,8 @@ export function SettingsPanel(props: Props) {
   const [memory, setMemory] = useState("");
   const [savingKey, setSavingKey] = useState(false);
   const [deletingKey, setDeletingKey] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState("");
   const [keyError, setKeyError] = useState("");
   const [editingMemory, setEditingMemory] = useState<string>();
   const [editingContent, setEditingContent] = useState("");
@@ -72,24 +75,46 @@ export function SettingsPanel(props: Props) {
               <button onClick={saveKey} disabled={!apiKey.trim() || savingKey}>{savingKey ? "Saving…" : "Save key"}</button>
             </div>
             {props.settings.api_key_configured && (
-              <button
-                className="text-danger-button"
-                disabled={deletingKey}
-                onClick={async () => {
-                  setDeletingKey(true);
-                  setKeyError("");
-                  try {
-                    await props.onDeleteApiKey();
-                  } catch (reason) {
-                    setKeyError(reason instanceof Error ? reason.message : String(reason));
-                  } finally {
-                    setDeletingKey(false);
-                  }
-                }}
-              >
-                <Trash2 size={15} /> {deletingKey ? "Removing…" : "Remove key from Keychain"}
-              </button>
+              <div className="key-actions">
+                <span>API key stored in macOS Keychain.</span>
+                <button
+                  className="secondary-button"
+                  disabled={testingConnection}
+                  onClick={async () => {
+                    setTestingConnection(true);
+                    setKeyError("");
+                    setConnectionStatus("");
+                    try {
+                      const result = await props.onTestConnection();
+                      setConnectionStatus(`Connected to ${result.model}`);
+                    } catch (reason) {
+                      setKeyError(reason instanceof Error ? reason.message : String(reason));
+                    } finally {
+                      setTestingConnection(false);
+                    }
+                  }}
+                >{testingConnection ? "Testing…" : "Test connection"}</button>
+                <button
+                  className="text-danger-button"
+                  disabled={deletingKey}
+                  onClick={async () => {
+                    setDeletingKey(true);
+                    setKeyError("");
+                    setConnectionStatus("");
+                    try {
+                      await props.onDeleteApiKey();
+                    } catch (reason) {
+                      setKeyError(reason instanceof Error ? reason.message : String(reason));
+                    } finally {
+                      setDeletingKey(false);
+                    }
+                  }}
+                >
+                  <Trash2 size={15} /> {deletingKey ? "Removing…" : "Remove key"}
+                </button>
+              </div>
             )}
+            {connectionStatus && <div className="inline-success">{connectionStatus}</div>}
             {keyError && <div className="inline-error key-error">{keyError}</div>}
           </div>
 

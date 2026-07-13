@@ -26,6 +26,7 @@ import type { GatewayInfo } from "./lib/gateway";
 import type { ApprovalRule, Grant, HistoryItem, MemoryItem, RunEvent, SessionSummary, Settings, ToolCall } from "./types";
 
 type ApprovalPrompt = { approvalId: string; toolName: string; arguments: Record<string, unknown> };
+type RetryRequest = { content: string; attachments: string[] };
 
 const defaultSettings: Settings = {
   model: "deepseek-v4-pro",
@@ -59,6 +60,9 @@ function App() {
   const [activeRun, setActiveRun] = useState<string>();
   const [approval, setApproval] = useState<ApprovalPrompt>();
   const [pendingFolder, setPendingFolder] = useState<string>();
+  const [createSessionAfterGrant, setCreateSessionAfterGrant] = useState(false);
+  const [choosingWorkspace, setChoosingWorkspace] = useState(false);
+  const [lastRequest, setLastRequest] = useState<RetryRequest>();
   const disconnectRef = useRef<(() => void) | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -96,11 +100,24 @@ function App() {
   async function connectGateway(info: GatewayInfo) {
       const gateway = new GatewayClient(info);
       await gateway.waitUntilHealthy(info.token ? 30_000 : 750);
+      let snapshot: [SessionSummary[], Grant[], Settings, MemoryItem[], ApprovalRule[]] | undefined;
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        try {
+          snapshot = await Promise.all([
+            gateway.sessions(), gateway.grants(), gateway.settings(), gateway.memories(), gateway.approvalRules(),
+          ]);
+          break;
+        } catch (reason) {
+          lastError = reason;
+          await new Promise((resolve) => window.setTimeout(resolve, 350));
+        }
+      }
+      if (!snapshot) throw lastError instanceof Error ? lastError : new Error("Poppy could not load local data");
+      const [sessionList, grantList, appSettings, memoryList, ruleList] = snapshot;
+      disconnectRef.current?.();
       setClient(gateway);
       setConnected(true);
-      const [sessionList, grantList, appSettings, memoryList, ruleList] = await Promise.all([
-        gateway.sessions(), gateway.grants(), gateway.settings(), gateway.memories(), gateway.approvalRules(),
-      ]);
       setSessions(sessionList);
       setGrants(grantList);
       setSettings(appSettings);
@@ -111,13 +128,18 @@ function App() {
 
   async function saveApiKey(apiKey: string) {
     setLoading(true);
+    let keyStored = false;
     try {
       const info = await invoke<GatewayInfo>("set_api_key", { apiKey });
+      keyStored = true;
       await connectGateway(info);
       setError("");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      throw reason;
+      const failure = keyStored
+        ? new Error("The API key was saved, but Poppy could not reconnect. Choose Try again or restart Poppy.")
+        : reason instanceof Error ? reason : new Error(String(reason));
+      setError(failure.message);
+      throw failure;
     } finally {
       setLoading(false);
     }
@@ -166,7 +188,7 @@ function App() {
     setActiveRun(undefined);
   }
 
-  async function chooseFolder() {
+  async function chooseFolder(forNewSession = false) {
     if (!client) return;
     let selectedPath: string | null = null;
     try {
@@ -176,33 +198,53 @@ function App() {
       selectedPath = window.prompt("Folder path") || null;
     }
     if (!selectedPath) return;
+    setCreateSessionAfterGrant(forNewSession);
     setPendingFolder(selectedPath);
   }
 
   async function authorizeFolder(canWrite: boolean, canShell: boolean) {
     if (!client || !pendingFolder) return;
     try {
-      await client.addGrant(pendingFolder, canWrite, canShell);
+      const path = pendingFolder;
+      await client.addGrant(path, canWrite, canShell);
       await refreshMeta();
       setPendingFolder(undefined);
+      if (createSessionAfterGrant) {
+        setCreateSessionAfterGrant(false);
+        await createSession(path);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
+  async function createSession(workspaceRoot: string) {
+    if (!client) return;
+    const session = await client.createSession(workspaceRoot);
+    setSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
+    setChoosingWorkspace(false);
+    await selectSession(client, session.id);
+  }
+
   async function newSession() {
     if (!client) return;
+    if (activeRun) {
+      setError("Stop the current task before switching conversations.");
+      return;
+    }
     if (!settings.api_key_configured) {
       setSettingsOpen(true);
       return;
     }
     if (!grants.length) {
-      await chooseFolder();
+      await chooseFolder(true);
       return;
     }
-    const session = await client.createSession(grants[0].path);
-    setSessions((current) => [session, ...current]);
-    await selectSession(client, session.id);
+    if (grants.length > 1) {
+      setChoosingWorkspace(true);
+      return;
+    }
+    await createSession(grants[0].path);
   }
 
   async function chooseAttachments() {
@@ -260,18 +302,20 @@ function App() {
         diffSummary: payload.diff_summary || [],
       });
     } else if (["run.completed", "run.cancelled", "run.failed"].includes(event.event_type)) {
+      if (event.event_type === "run.failed") {
+        setError(String(payload.error || "The task failed before Poppy could finish."));
+      } else if (event.event_type === "run.completed") {
+        setLastRequest(undefined);
+      }
       setActiveRun(undefined);
       setApproval(undefined);
     }
   }
 
-  async function sendMessage() {
-    if (!client || !selectedId || !input.trim() || activeRun) return;
-    const content = input.trim();
-    setInput("");
+  async function runMessage(content: string, attached: string[]) {
+    if (!client || !selectedId || activeRun) return;
     setError("");
-    const attached = [...attachments];
-    setAttachments([]);
+    setLastRequest({ content, attachments: attached });
     setMessages((current) => [...current, { role: "user", content, attachments: attached }, { role: "assistant", content: "" }]);
     try {
       const run = await client.startRun(selectedId, content, attached);
@@ -286,13 +330,41 @@ function App() {
     } catch (reason) {
       setActiveRun(undefined);
       setError(reason instanceof Error ? reason.message : String(reason));
+      setMessages((current) => current.slice(0, -2));
+    }
+  }
+
+  async function sendMessage() {
+    if (!input.trim()) return;
+    const content = input.trim();
+    const attached = [...attachments];
+    setInput("");
+    setAttachments([]);
+    await runMessage(content, attached);
+  }
+
+  async function retryLastRequest() {
+    if (!lastRequest || activeRun) return;
+    await runMessage(lastRequest.content, lastRequest.attachments);
+  }
+
+  async function cancelActiveRun() {
+    if (!client || !activeRun) return;
+    try {
+      await client.cancelRun(activeRun);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
   async function resolveApproval(decision: "allow_once" | "allow_always" | "deny") {
     if (!client || !activeRun || !approval) return;
-    await client.approve(activeRun, approval.approvalId, decision);
-    setApproval(undefined);
+    try {
+      await client.approve(activeRun, approval.approvalId, decision);
+      setApproval(undefined);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }
 
   const canSend = !!client && !!selectedId && !!input.trim() && !activeRun;
@@ -304,7 +376,8 @@ function App() {
           sessions={sessions}
           grants={grants}
           selectedId={selectedId}
-          onSelect={(id) => client && void selectSession(client, id)}
+          busy={!!activeRun}
+          onSelect={(id) => client && !activeRun && void selectSession(client, id)}
           onNew={() => void newSession()}
           onAddFolder={() => void chooseFolder()}
           onSettings={() => setSettingsOpen(true)}
@@ -389,7 +462,7 @@ function App() {
 
         {connected && selectedId && (
           <div className="composer-wrap">
-            {error && <div className="inline-error">{error}</div>}
+            {error && <div className="inline-error"><span>{error}</span>{lastRequest && !activeRun && <button onClick={() => void retryLastRequest()}>Retry</button>}</div>}
             <div className="composer">
               <div className="composer-input">
                 {!!attachments.length && <div className="composer-attachments">{attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}<button aria-label="Remove attachment" onClick={() => setAttachments((current) => current.filter((item) => item !== path))}><X size={12} /></button></span>)}</div>}
@@ -405,7 +478,7 @@ function App() {
               </div>
               <button className="composer-tool" onClick={() => void chooseAttachments()} aria-label="Attach files"><Paperclip size={17} /></button>
               {activeRun ? (
-                <button className="send-button stop" onClick={() => client && void client.cancelRun(activeRun)} aria-label="Stop"><Square size={15} fill="currentColor" /></button>
+                <button className="send-button stop" onClick={() => void cancelActiveRun()} aria-label="Stop"><Square size={15} fill="currentColor" /></button>
               ) : (
                 <button className="send-button" disabled={!canSend} onClick={() => void sendMessage()} aria-label="Send"><ArrowUp size={19} /></button>
               )}
@@ -439,11 +512,30 @@ function App() {
             <p>Choose exactly what Poppy may do inside this folder.</p>
             <pre>{pendingFolder}</pre>
             <div className="folder-permission-actions">
-              <button className="ghost-button" onClick={() => setPendingFolder(undefined)}>Cancel</button>
+              <button className="ghost-button" onClick={() => { setPendingFolder(undefined); setCreateSessionAfterGrant(false); }}>Cancel</button>
               <button className="secondary-button" onClick={() => void authorizeFolder(false, false)}>Read only</button>
               <button className="secondary-button" onClick={() => void authorizeFolder(true, false)}>Read &amp; write</button>
               <button className="primary-button" onClick={() => void authorizeFolder(true, true)}>Write + Shell</button>
             </div>
+          </section>
+        </div>
+      )}
+
+      {choosingWorkspace && (
+        <div className="approval-backdrop">
+          <section className="approval-dialog folder-dialog">
+            <div className="approval-icon"><FolderOpen size={24} /></div>
+            <h2>Choose a workspace</h2>
+            <p>Each conversation is limited to one authorized folder.</p>
+            <div className="workspace-choice-list">
+              {grants.map((grant) => (
+                <button className="workspace-choice" key={grant.id} onClick={() => void createSession(grant.path)}>
+                  <strong>{grant.path.split("/").pop()}</strong>
+                  <span>{grant.path}</span>
+                </button>
+              ))}
+            </div>
+            <div className="approval-actions"><button className="ghost-button" onClick={() => setChoosingWorkspace(false)}>Cancel</button></div>
           </section>
         </div>
       )}
@@ -458,6 +550,10 @@ function App() {
           onSaveSettings={async (values) => { if (client) setSettings(await client.updateSettings(values)); }}
           onSaveApiKey={saveApiKey}
           onDeleteApiKey={deleteApiKey}
+          onTestConnection={async () => {
+            if (!client) throw new Error("Poppy local gateway is unavailable");
+            return client.testConnection();
+          }}
           onAddFolder={() => void chooseFolder()}
           onDeleteGrant={async (id) => { if (client) { await client.deleteGrant(id); await refreshMeta(); } }}
           onAddMemory={async (content) => { if (client) { await client.addMemory(content); await refreshMeta(); } }}

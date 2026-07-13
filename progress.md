@@ -82,6 +82,10 @@
   - 使用 PyInstaller 构建 `poppy-gateway` Tauri sidecar，并实现认证关闭接口。
   - 将产品名、Bundle ID、托盘和窗口统一为 Poppy。
   - 新增 Poppy 使用、构建和故障排查文档。
+  - 完成第一轮 10 项需求逐条审计，修复目录授权撤销后缓存权限未立即失效的问题。
+  - 新增多授权目录的新会话选择、模型失败重试和保存密钥后的 Gateway 重连重试。
+  - 流式 Provider 在取消时主动关闭响应，避免没有新 token 时停止按钮长时间无响应。
+  - 用户已成功将 DeepSeek API Key 写入 macOS Keychain，并完成新构建的钥匙串访问授权。
 
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
@@ -96,6 +100,7 @@
 | Poppy 最终 Python 回归 | `uv run pytest tests -q` | Runtime/Gateway/权限/附件无回归 | 155 passed，6 warnings | 通过 |
 | Poppy 前端构建 | `npm run build` | TypeScript 和 Vite 构建通过 | 构建成功 | 通过 |
 | Poppy Rust 检查 | `cargo fmt --check && cargo check` | 格式与 Tauri 壳编译通过 | 通过 | 通过 |
+| Poppy 审计后全量回归 | `uv run pytest tests -q` | 授权撤销、流式停止与原有行为无回归 | 158 passed，6 warnings | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |

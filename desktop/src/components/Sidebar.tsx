@@ -5,6 +5,7 @@ type Props = {
   sessions: SessionSummary[];
   grants: Grant[];
   selectedId?: string;
+  busy?: boolean;
   onSelect: (id: string) => void;
   onNew: () => void;
   onAddFolder: () => void;
@@ -12,7 +13,7 @@ type Props = {
   onRename: (id: string, currentTitle: string) => void;
 };
 
-export function Sidebar({ sessions, grants, selectedId, onSelect, onNew, onAddFolder, onSettings, onRename }: Props) {
+export function Sidebar({ sessions, grants, selectedId, busy, onSelect, onNew, onAddFolder, onSettings, onRename }: Props) {
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -23,7 +24,7 @@ export function Sidebar({ sessions, grants, selectedId, onSelect, onNew, onAddFo
         </div>
       </div>
 
-      <button className="primary-action" onClick={onNew} disabled={!grants.length}>
+      <button className="primary-action" onClick={onNew} disabled={busy}>
         <MessageSquarePlus size={17} /> New conversation
       </button>
 
@@ -34,6 +35,7 @@ export function Sidebar({ sessions, grants, selectedId, onSelect, onNew, onAddFo
             <button
               key={session.id}
               className={`session-item ${selectedId === session.id ? "active" : ""}`}
+              disabled={busy && selectedId !== session.id}
               onClick={() => onSelect(session.id)}
             >
               <span>{session.title}</span>
@@ -41,7 +43,7 @@ export function Sidebar({ sessions, grants, selectedId, onSelect, onNew, onAddFo
                 className="session-menu"
                 role="button"
                 aria-label={`Rename ${session.title}`}
-                onClick={(event) => { event.stopPropagation(); onRename(session.id, session.title); }}
+                onClick={(event) => { event.stopPropagation(); if (!busy) onRename(session.id, session.title); }}
               ><MoreHorizontal size={15} /></span>
             </button>
           ))}

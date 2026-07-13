@@ -146,6 +146,12 @@ export class GatewayClient {
     });
   }
 
+  testConnection() {
+    return this.request<{ status: string; model: string }>("/settings/test-connection", {
+      method: "POST",
+    });
+  }
+
   grants() {
     return this.request<Grant[]>("/grants");
   }
