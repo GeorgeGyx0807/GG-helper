@@ -35,6 +35,7 @@ tmp/
 artifacts/
 release/
 readme_intro_locked/
+output/
 
 # Local secrets and provider configuration
 .env
