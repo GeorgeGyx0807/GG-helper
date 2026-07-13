@@ -46,11 +46,11 @@
 
 ### 阶段 6：sidecar 打包与完整验收
 - [x] 打包 Python Gateway 并由 Tauri 管理生命周期
-- [ ] 生成可双击启动的 macOS `.app`
-- [ ] 执行真实 DeepSeek 冒烟测试和桌面端端到端场景
-- [ ] 按设计文档逐项完成验收审计
+- [x] 生成可双击启动的 macOS `.app`
+- [x] 执行真实 DeepSeek 冒烟测试和桌面端端到端场景
+- [x] 按设计文档逐项完成验收审计
 - [x] 更新使用、构建和故障排查文档
-- **状态：** in_progress
+- **状态：** complete
 
 ## 关键问题
 1. 当前机器是否具备 Node、Rust、Tauri 和 macOS 打包所需环境？

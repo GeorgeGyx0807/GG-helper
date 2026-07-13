@@ -89,6 +89,9 @@
   - 修复 Keychain 弹窗阻塞启动时前端误回退到开发地址 `127.0.0.1:8765` 的竞态；生产应用现在持续等待 Tauri 返回真实随机端口和令牌。
   - 用实际 OPTIONS 请求确认 WebKit `Load failed` 的直接原因是 Gateway 返回 405；新增仅允许 Tauri 本地来源的 CORS 中间件和拒绝不可信来源测试。
   - 真实 Test connection 到达 DeepSeek 后只返回 thinking 块；按 DeepSeek 官方 Anthropic 参数显式关闭 thinking，并将检测输出额度由 16 提升到 64。
+  - 用户确认 Poppy 连接成功，并在已授权目录的真实会话中发送“你好”后收到 DeepSeek 回复。
+  - 最新真实 Run `run_20260713-165620-4ac1b9` 持久化状态为 completed，stop_reason 为 final_answer_returned。
+  - 将用户实测成功的 bundle 覆盖到仓库根目录 `Poppy.app`，并核对主程序和 sidecar SHA-256 完全一致。
 
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |

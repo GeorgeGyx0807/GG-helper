@@ -35,6 +35,7 @@
 - `keyring` 4.x 的 macOS 后端使用系统 Keychain，并提供删除凭据接口；Poppy 设置页支持写入和移除 DeepSeek API Key。
 - 开发者本地 ad-hoc 重新签名会改变应用代码身份；访问上一构建保存的 Keychain 条目时，macOS 会要求用户重新授权。这不是 API Key 错误，输入的是 Mac 登录密码。
 - 审计发现桌面 Agent 缓存必须把当前授权和模型设置纳入签名，并且每次 Run 前重新验证目录授权，否则撤销/降级授权后缓存能力可能继续存在；当前已修复并覆盖测试。
+- Tauri WebView 对回环 HTTP 仍执行浏览器 CORS；只有 CSP `connect-src` 不够。缺少 CORS 中间件时预检返回 405，WebKit 只显示 `Load failed`；限制允许的 Tauri origins 后实际预检返回 200。
 
 ## 技术决策
 | 决策 | 理由 |
