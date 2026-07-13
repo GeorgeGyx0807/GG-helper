@@ -12,14 +12,28 @@ import type {
 
 export type GatewayInfo = { base_url: string; token: string };
 
-export async function resolveGatewayInfo(): Promise<GatewayInfo> {
-  try {
-    return await invoke<GatewayInfo>("gateway_info");
-  } catch {
-    const base_url = import.meta.env.VITE_PICO_GATEWAY_URL || "http://127.0.0.1:8765";
-    const token = import.meta.env.VITE_PICO_GATEWAY_TOKEN || "";
-    return { base_url, token };
+export async function resolveGatewayInfo(timeoutMs = 60_000): Promise<GatewayInfo> {
+  const configuredUrl = import.meta.env.VITE_PICO_GATEWAY_URL;
+  if (configuredUrl) {
+    return {
+      base_url: configuredUrl,
+      token: import.meta.env.VITE_PICO_GATEWAY_TOKEN || "",
+    };
   }
+
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  do {
+    try {
+      return await invoke<GatewayInfo>("gateway_info");
+    } catch (reason) {
+      lastError = reason;
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  } while (Date.now() < deadline);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(String(lastError || "Poppy local gateway did not start"));
 }
 
 export class GatewayClient {
