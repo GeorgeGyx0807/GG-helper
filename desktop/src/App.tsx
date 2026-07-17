@@ -148,6 +148,10 @@ function App() {
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [renamingSession, setRenamingSession] = useState<{ id: string; title: string }>();
   const [renameValue, setRenameValue] = useState("");
+  const [notebookCreatorOpen, setNotebookCreatorOpen] = useState(false);
+  const [notebookName, setNotebookName] = useState("");
+  const [notebookSaving, setNotebookSaving] = useState(false);
+  const [notebookDocumentIds, setNotebookDocumentIds] = useState<string[]>([]);
   const [lastRequest, setLastRequest] = useState<RetryRequest>();
   const [readerPath, setReaderPath] = useState("");
   const [readerCitation, setReaderCitation] = useState<Citation>();
@@ -411,20 +415,43 @@ function App() {
     }
   }
 
+  function openNotebookCreator() {
+    if (activeRun) return;
+    setNotebookName("");
+    const scopedDocumentId = selected?.knowledge_scope?.kind === "document"
+      ? selected.knowledge_scope.id
+      : "";
+    setNotebookDocumentIds(
+      scopedDocumentId ? [scopedDocumentId] : libraryDocuments.map((document) => document.id),
+    );
+    setNotebookCreatorOpen(true);
+  }
+
   async function createNotebookFromVisibleDocuments() {
     if (!client) return;
-    const name = window.prompt("给这个 Notebook 起一个名字");
-    if (!name?.trim()) return;
+    const name = notebookName.trim();
+    if (!name || notebookSaving) return;
+    if (!notebookDocumentIds.length) {
+      setError("当前范围还没有已索引文档，暂时无法创建 Notebook。");
+      setNotebookCreatorOpen(false);
+      return;
+    }
+    setNotebookSaving(true);
     try {
-      const created = await client.createKnowledgeSpace(name.trim());
+      const created = await client.createKnowledgeSpace(name);
       const configured = await client.updateKnowledgeSpace(created.id, {
-        document_ids: libraryDocuments.map((document) => document.id),
+        document_ids: notebookDocumentIds,
       });
       setKnowledgeSpaces((current) => [...current, configured].sort((a, b) => a.name.localeCompare(b.name)));
       if (selectedId) await changeKnowledgeScope(`notebook:${created.id}`);
+      setNotebookCreatorOpen(false);
+      setNotebookName("");
+      setNotebookDocumentIds([]);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setNotebookSaving(false);
     }
   }
 
@@ -935,7 +962,7 @@ function App() {
                   <option value={`document:${document.id}`} key={document.id}>单文档 · {document.display_name}</option>
                 ))}
               </select>
-              <button className="scope-add-button" onClick={() => void createNotebookFromVisibleDocuments()} disabled={Boolean(activeRun)} title="用当前列表里的文档创建 Notebook"><Plus size={13} /> Notebook</button>
+              <button className="scope-add-button" onClick={openNotebookCreator} disabled={Boolean(activeRun)} title="把当前范围内的文档保存为一个专题 Notebook"><Plus size={13} /> Notebook</button>
               <small>本轮：{selected?.knowledge_scope?.label || "自动"}；写出完整文件名会切到对应文档</small>
             </div>}
             {taskDraft && <div className="draft-context-bar">
@@ -1086,6 +1113,61 @@ function App() {
         </div>
       )}
 
+      {notebookCreatorOpen && (
+        <div className="approval-backdrop" onMouseDown={() => !notebookSaving && setNotebookCreatorOpen(false)}>
+          <section className="approval-dialog notebook-dialog" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="approval-icon"><BookOpenText size={22} /></div>
+            <h2>创建 Notebook</h2>
+            <p>
+              Notebook 是一组固定的专题资料。创建后，在聊天中选择它，Poppy 只会从其中的文档取证。
+            </p>
+            <div className="notebook-source-summary">
+              <strong>已选择 {notebookDocumentIds.length} / {libraryDocuments.length} 篇文档</strong>
+              <span>{selected?.knowledge_scope?.label || (selected?.session_type === "project" ? activeProjectName : "当前知识范围")}</span>
+            </div>
+            <div className="notebook-document-actions">
+              <button onClick={() => setNotebookDocumentIds(libraryDocuments.map((document) => document.id))}>全选</button>
+              <button onClick={() => setNotebookDocumentIds([])}>清空</button>
+            </div>
+            <div className="notebook-document-list">
+              {libraryDocuments.map((document) => (
+                <label key={document.id}>
+                  <input
+                    type="checkbox"
+                    checked={notebookDocumentIds.includes(document.id)}
+                    onChange={(event) => setNotebookDocumentIds((current) => event.target.checked
+                      ? [...new Set([...current, document.id])]
+                      : current.filter((id) => id !== document.id))}
+                  />
+                  <span>{document.display_name}</span>
+                </label>
+              ))}
+            </div>
+            <input
+              className="rename-input"
+              value={notebookName}
+              autoFocus
+              placeholder="例如：Agent 记忆论文"
+              onChange={(event) => setNotebookName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && notebookName.trim()) {
+                  event.preventDefault();
+                  void createNotebookFromVisibleDocuments();
+                }
+                if (event.key === "Escape" && !notebookSaving) setNotebookCreatorOpen(false);
+              }}
+            />
+            {!libraryDocuments.length && <div className="inline-error">当前范围还没有已完成索引的文档。</div>}
+            <div className="approval-actions">
+              <button className="ghost-button" disabled={notebookSaving} onClick={() => setNotebookCreatorOpen(false)}>取消</button>
+              <button className="primary-button" disabled={!notebookName.trim() || !notebookDocumentIds.length || notebookSaving} onClick={() => void createNotebookFromVisibleDocuments()}>
+                {notebookSaving ? "创建中…" : "创建并切换"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {readerPath && client && (
         <Suspense fallback={<div className="reader-loading-overlay">正在加载 PDF 阅读器…</div>}>
           <PdfReader
@@ -1155,7 +1237,7 @@ function App() {
           onAddLibrarySource={() => void chooseLibrarySource()}
           onDeleteLibrarySource={async (id) => { if (client) { await client.deleteLibrarySource(id); await refreshMeta(); } }}
           onReindexLibrary={async (id) => { if (client) { await client.reindexLibrary(id); await refreshMeta(); } }}
-          onCreateKnowledgeSpace={async () => { await createNotebookFromVisibleDocuments(); await refreshMeta(); }}
+          onCreateKnowledgeSpace={async () => { setSettingsOpen(false); openNotebookCreator(); }}
           onDeleteKnowledgeSpace={async (id) => { if (client) { await client.deleteKnowledgeSpace(id); await refreshMeta(); } }}
         />
       )}
