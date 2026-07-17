@@ -3,17 +3,20 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pico"
+name = "poppy"
 version = "0.1.0"
-description = "Small local coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, and Ollama models"
+description = "Poppy local-first desktop assistant and coding agent"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.116,<1",
+  "lark-channel-sdk==1.1.0",
+  "markitdown[docx,pdf,pptx,xls,xlsx]>=0.1.6",
   "uvicorn[standard]>=0.35,<1",
+  "watchdog>=6,<7",
 ]
 
 [project.scripts]
-pico = "pico.cli:main"
+poppy = "poppy.cli:main"
 
 [dependency-groups]
 dev = [
@@ -24,7 +27,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["pico*"]
+include = ["poppy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

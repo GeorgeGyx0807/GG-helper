@@ -4,15 +4,15 @@ from unittest.mock import patch
 
 import pytest
 
-from pico import CancellationToken, FakeModelClient, Pico, RunCancelled, SessionStore, WorkspaceContext
-from pico.providers.clients import AnthropicCompatibleModelClient
+from poppy import CancellationToken, FakeModelClient, Poppy, RunCancelled, SessionStore, WorkspaceContext
+from poppy.providers.clients import AnthropicCompatibleModelClient
 
 
 def build_agent(tmp_path, model_client, **kwargs):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     workspace = WorkspaceContext.build(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
-    return Pico(
+    store = SessionStore(tmp_path / ".poppy" / "sessions")
+    return Poppy(
         model_client=model_client,
         workspace=workspace,
         session_store=store,
@@ -273,3 +273,40 @@ def test_runtime_suppresses_streamed_tool_protocol_from_visible_events(tmp_path)
     assert visible == "Done."
     assert "<tool" not in visible
     assert "<final>" not in visible
+
+
+def test_runtime_does_not_stream_narration_before_a_later_tool_call(tmp_path):
+    class NarratedToolStreamingClient:
+        supports_prompt_cache = False
+        last_completion_metadata = {}
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_stream(self, prompt, max_new_tokens, on_delta, cancellation_token, **kwargs):
+            del prompt, max_new_tokens, cancellation_token, kwargs
+            self.calls += 1
+            if self.calls > 1:
+                output = "<final>已读取。</final>"
+                on_delta(output)
+                return output
+            output = (
+                "我来帮你读取这个 PDF。"
+                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>'
+            )
+            for chunk in (output[:4], output[4:14], output[14:]):
+                on_delta(chunk)
+            return output
+
+    events = []
+    agent = build_agent(tmp_path, NarratedToolStreamingClient(), event_handler=events.append)
+
+    assert agent.ask("Read README") == "已读取。"
+    visible = "".join(
+        event["payload"]["delta"]
+        for event in events
+        if event["event_type"] == "message.delta"
+    )
+    assert visible == "已读取。"
+    assert "我来帮你" not in visible
+    assert "<tool" not in visible

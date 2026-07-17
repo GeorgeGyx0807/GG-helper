@@ -1,23 +1,32 @@
 use keyring::v1::Entry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
+    fs,
     io::{Read, Write},
     net::TcpListener,
     net::TcpStream,
+    path::PathBuf,
     sync::Mutex,
     time::Duration,
 };
 use tauri::{
+    ipc::Response,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_shell::{process::CommandChild, ShellExt};
 use uuid::Uuid;
 
+mod macos_selection;
+mod quick_window;
+
 const KEYCHAIN_SERVICE: &str = "com.george.poppy";
-const KEYCHAIN_ACCOUNT: &str = "deepseek-api-key";
+const DEEPSEEK_KEYCHAIN_ACCOUNT: &str = "deepseek-api-key";
+const DASHSCOPE_KEYCHAIN_ACCOUNT: &str = "dashscope-api-key";
+const FEISHU_KEYCHAIN_ACCOUNT: &str = "feishu-app-secret";
 const SIDECAR_NAME: &str = "poppy-gateway";
 
 #[derive(Clone, Serialize)]
@@ -30,20 +39,120 @@ struct GatewayInfo {
 struct GatewayRuntime {
     info: Option<GatewayInfo>,
     child: Option<CommandChild>,
+    secrets: HashMap<String, String>,
+    checked_secrets: HashSet<String>,
 }
 
 #[derive(Default)]
 struct GatewayState(Mutex<GatewayRuntime>);
 
-fn keychain_entry() -> Result<Entry, String> {
-    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|error| error.to_string())
+#[derive(Default)]
+struct OpenedPdfState(Mutex<Vec<String>>);
+
+#[derive(Clone, Deserialize, Serialize)]
+struct SecretUsage {
+    provider: String,
+    feishu_enabled: bool,
 }
 
-fn read_api_key() -> Option<String> {
-    keychain_entry()
+impl Default for SecretUsage {
+    fn default() -> Self {
+        Self {
+            provider: "deepseek".to_string(),
+            feishu_enabled: false,
+        }
+    }
+}
+
+fn keychain_account(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "deepseek" => Ok(DEEPSEEK_KEYCHAIN_ACCOUNT),
+        "dashscope" => Ok(DASHSCOPE_KEYCHAIN_ACCOUNT),
+        "feishu" => Ok(FEISHU_KEYCHAIN_ACCOUNT),
+        _ => Err("不支持的密钥类型".to_string()),
+    }
+}
+
+fn keychain_entry(provider: &str) -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, keychain_account(provider)?).map_err(|error| error.to_string())
+}
+
+fn read_api_key(provider: &str) -> Option<String> {
+    keychain_entry(provider)
         .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn cached_api_key(state: &GatewayState, provider: &str) -> Option<String> {
+    if let Ok(runtime) = state.0.lock() {
+        if runtime.checked_secrets.contains(provider) {
+            return runtime.secrets.get(provider).cloned();
+        }
+    }
+    let value = read_api_key(provider);
+    if let Ok(mut runtime) = state.0.lock() {
+        runtime.checked_secrets.insert(provider.to_string());
+        if let Some(secret) = value.as_ref() {
+            runtime
+                .secrets
+                .insert(provider.to_string(), secret.to_string());
+        }
+    }
+    value
+}
+
+fn cache_api_key(state: &GatewayState, provider: &str, value: Option<&str>) {
+    if let Ok(mut runtime) = state.0.lock() {
+        runtime.checked_secrets.insert(provider.to_string());
+        match value {
+            Some(secret) => {
+                runtime
+                    .secrets
+                    .insert(provider.to_string(), secret.to_string());
+            }
+            None => {
+                runtime.secrets.remove(provider);
+            }
+        }
+    }
+}
+
+fn secret_usage_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("secret-usage.json"))
+        .map_err(|error| error.to_string())
+}
+
+fn read_secret_usage(app: &AppHandle) -> SecretUsage {
+    secret_usage_path(app)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(|usage: &SecretUsage| matches!(usage.provider.as_str(), "deepseek" | "dashscope"))
+        .unwrap_or_default()
+}
+
+fn write_secret_usage(app: &AppHandle, usage: &SecretUsage) -> Result<(), String> {
+    let path = secret_usage_path(app)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法确定 Poppy 数据目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec(usage).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    fs::rename(temporary, path).map_err(|error| error.to_string())
 }
 
 fn stop_gateway(state: &GatewayState) {
@@ -80,7 +189,7 @@ fn request_gateway_shutdown(info: &GatewayInfo) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
     let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
     let request = format!(
-        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Pico-Token: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Poppy-Token: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         info.token
     );
     if stream.write_all(request.as_bytes()).is_ok() {
@@ -119,8 +228,19 @@ fn start_gateway(app: &AppHandle, state: &GatewayState) -> Result<GatewayInfo, S
             command = command.env(name, value);
         }
     }
-    if let Some(api_key) = read_api_key() {
-        command = command.env("PICO_DEEPSEEK_API_KEY", api_key);
+    let usage = read_secret_usage(app);
+    if let Some(api_key) = cached_api_key(state, &usage.provider) {
+        let variable = if usage.provider == "dashscope" {
+            "POPPY_DASHSCOPE_API_KEY"
+        } else {
+            "POPPY_DEEPSEEK_API_KEY"
+        };
+        command = command.env(variable, api_key);
+    }
+    if usage.feishu_enabled {
+        if let Some(app_secret) = cached_api_key(state, "feishu") {
+            command = command.env("POPPY_FEISHU_APP_SECRET", app_secret);
+        }
     }
 
     let (mut events, child) = command.spawn().map_err(|error| error.to_string())?;
@@ -176,24 +296,47 @@ fn set_api_key(
     app: AppHandle,
     state: State<'_, GatewayState>,
     api_key: String,
+    provider: String,
 ) -> Result<GatewayInfo, String> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        return Err("DeepSeek API key must not be empty".to_string());
+        return Err("API Key 不能为空".to_string());
     }
-    keychain_entry()?
+    keychain_entry(&provider)?
         .set_password(api_key)
         .map_err(|error| error.to_string())?;
+    cache_api_key(&state, &provider, Some(api_key));
     start_gateway(&app, &state)
 }
 
 #[tauri::command]
-fn delete_api_key(app: AppHandle, state: State<'_, GatewayState>) -> Result<GatewayInfo, String> {
-    if read_api_key().is_some() {
-        keychain_entry()?
-            .delete_credential()
-            .map_err(|error| error.to_string())?;
+fn delete_api_key(
+    app: AppHandle,
+    state: State<'_, GatewayState>,
+    provider: String,
+) -> Result<GatewayInfo, String> {
+    let _ = keychain_entry(&provider)?.delete_credential();
+    cache_api_key(&state, &provider, None);
+    start_gateway(&app, &state)
+}
+
+#[tauri::command]
+fn configure_secret_usage(
+    app: AppHandle,
+    state: State<'_, GatewayState>,
+    provider: String,
+    feishu_enabled: bool,
+) -> Result<GatewayInfo, String> {
+    if !matches!(provider.as_str(), "deepseek" | "dashscope") {
+        return Err("不支持的模型密钥类型".to_string());
     }
+    write_secret_usage(
+        &app,
+        &SecretUsage {
+            provider,
+            feishu_enabled,
+        },
+    )?;
     start_gateway(&app, &state)
 }
 
@@ -205,20 +348,70 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn toggle_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            show_main_window(app);
-        }
+fn show_quick_capture(app: &AppHandle) {
+    let capture = macos_selection::capture_frontmost_selection();
+    quick_window::show(app, capture);
+    let info = app
+        .state::<GatewayState>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.info.clone());
+    if let Some(info) = info {
+        let _ = app.emit_to("quick", "gateway-ready", info);
     }
+}
+
+#[tauri::command]
+fn capture_selection() -> macos_selection::SelectionCapture {
+    macos_selection::capture_frontmost_selection()
+}
+
+#[tauri::command]
+fn request_accessibility_permission() -> bool {
+    macos_selection::accessibility_status(true)
+}
+
+#[tauri::command]
+fn hide_quick_window(app: AppHandle) {
+    quick_window::hide(&app);
+}
+
+#[tauri::command]
+fn read_pdf_bytes(path: String) -> Result<Response, String> {
+    const MAX_READER_BYTES: u64 = 100 * 1024 * 1024;
+    let resolved = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("无法打开 PDF：{error}"))?;
+    if !resolved.is_file()
+        || !resolved
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    {
+        return Err("请选择有效的 PDF 文件".to_string());
+    }
+    let metadata = fs::metadata(&resolved).map_err(|error| format!("无法读取 PDF：{error}"))?;
+    if metadata.len() > MAX_READER_BYTES {
+        return Err("内置阅读器当前支持最大 100MB 的 PDF".to_string());
+    }
+    let bytes = fs::read(&resolved).map_err(|error| format!("无法读取 PDF：{error}"))?;
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
+fn take_opened_pdf_paths(state: State<'_, OpenedPdfState>) -> Vec<String> {
+    state
+        .0
+        .lock()
+        .map(|mut paths| std::mem::take(&mut *paths))
+        .unwrap_or_default()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(GatewayState::default())
+        .manage(OpenedPdfState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -226,7 +419,7 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
-                        toggle_main_window(app);
+                        show_quick_capture(app);
                     }
                 })
                 .build(),
@@ -236,20 +429,23 @@ pub fn run() {
                 .register("CommandOrControl+Shift+Space")?;
 
             let show_item = MenuItem::with_id(app, "show", "Show Poppy", true, None::<&str>)?;
+            let quick_item = MenuItem::with_id(app, "quick", "Quick question", true, None::<&str>)?;
             let hide_item = MenuItem::with_id(app, "hide", "Hide Poppy", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Poppy", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&quick_item, &show_item, &hide_item, &quit_item])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().expect("Poppy app icon").clone())
                 .tooltip("Poppy 桌面个人助手")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quick" => show_quick_capture(app),
                     "show" => show_main_window(app),
                     "hide" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.hide();
                         }
+                        quick_window::hide(app);
                     }
                     "quit" => {
                         stop_gateway(&app.state::<GatewayState>());
@@ -284,12 +480,41 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             gateway_info,
             set_api_key,
-            delete_api_key
+            delete_api_key,
+            configure_secret_usage,
+            capture_selection,
+            request_accessibility_permission,
+            hide_quick_window,
+            read_pdf_bytes,
+            take_opened_pdf_paths
         ])
         .build(tauri::generate_context!())
         .expect("error while building Poppy desktop application");
 
     app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Opened { urls } = &event {
+            let paths = urls
+                .iter()
+                .filter_map(|url| url.to_file_path().ok())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                })
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                if let Ok(mut queued) = app.state::<OpenedPdfState>().0.lock() {
+                    queued.extend(paths.clone());
+                }
+                show_main_window(app);
+                let _ = app.emit("open-pdf", paths);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(event, RunEvent::Reopen { .. }) {
+            show_main_window(app);
+        }
         if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
             stop_gateway(&app.state::<GatewayState>());
         }

@@ -5,11 +5,11 @@ import sys
 
 from fastapi.testclient import TestClient
 
-from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
-from pico.api import create_gateway_app
-from pico.application.controller import DesktopController
-from pico.run_store import RunStore
-from pico.storage import AppPaths, DesktopDatabase
+from poppy import FakeModelClient, Poppy, SessionStore, WorkspaceContext
+from poppy.api import create_gateway_app
+from poppy.application.controller import DesktopController
+from poppy.run_store import RunStore
+from poppy.storage import AppPaths, DesktopDatabase
 
 
 class FakeDesktopAgentFactory:
@@ -27,10 +27,12 @@ class FakeDesktopAgentFactory:
             "run_store": RunStore(self.paths.runs),
             "approval_policy": config.approval_policy,
             "allowed_tools": config.allowed_tools,
+            "library_searcher": config.library_searcher,
+            "personal_memory_sink": config.personal_memory_sink,
         }
         if config.session_id:
-            return Pico.from_session(session_id=config.session_id, **kwargs)
-        return Pico(**kwargs)
+            return Poppy.from_session(session_id=config.session_id, **kwargs)
+        return Poppy(**kwargs)
 
     def test_connection(self, config):
         return {"status": "ok", "model": config.model}
@@ -43,7 +45,7 @@ def build_gateway(tmp_path, outputs):
     factory = FakeDesktopAgentFactory(paths, outputs)
     controller = DesktopController(paths=paths, database=database, agent_factory=factory)
     app = create_gateway_app(controller=controller, connection_token="desktop-token")
-    return controller, TestClient(app), {"X-Pico-Token": "desktop-token"}
+    return controller, TestClient(app), {"X-Poppy-Token": "desktop-token"}
 
 
 def wait_for_terminal(client, headers, run_id, timeout=2):
@@ -73,11 +75,120 @@ def test_gateway_requires_connection_token_for_every_http_route(tmp_path):
     _controller, client, headers = build_gateway(tmp_path, ["<final>ok</final>"])
 
     assert client.get("/health").status_code == 401
-    assert client.get("/health", headers={"X-Pico-Token": "wrong"}).status_code == 401
+    assert client.get("/health", headers={"X-Poppy-Token": "wrong"}).status_code == 401
     assert client.get("/health", headers=headers).json() == {
         "status": "ok",
         "service": "poppy-desktop-gateway",
     }
+
+
+def test_filename_mention_and_manual_document_lock_keep_retrieval_scoped(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    first = workspace / "paper-a.md"
+    second = workspace / "paper-b.md"
+    first.write_text("shared keyword\nA-only evidence", encoding="utf-8")
+    second.write_text("shared keyword\nB-only evidence", encoding="utf-8")
+    controller, client, headers = build_gateway(tmp_path, ["<final>只引用 A。</final>"])
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "Papers"},
+    ).json()
+
+    documents = client.get(
+        "/library/documents", headers=headers, params={"session_id": session["id"]}
+    ).json()
+    by_name = {item["display_name"]: item for item in documents}
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={"session_id": session["id"], "message": "paper-a.md 里的 shared keyword 是什么？"},
+    ).json()
+    assert wait_for_terminal(client, headers, started["run_id"])["answer"] == "只引用 A。"
+    prompt = controller._agents[session["id"]].model_client.prompts[-1]
+    assert "A-only evidence" in prompt
+    assert "B-only evidence" not in prompt
+    detail = client.get(f"/sessions/{session['id']}", headers=headers).json()
+    assert detail["locked_document"]["display_name"] == "paper-a.md"
+
+    changed = client.patch(
+        f"/sessions/{session['id']}/document-lock",
+        headers=headers,
+        json={"document_id": by_name["paper-b.md"]["id"]},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["locked_document"]["display_name"] == "paper-b.md"
+
+
+def test_locked_document_returns_deterministic_unknown_when_evidence_is_absent(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    path = workspace / "paper.md"
+    path.write_text("known evidence only", encoding="utf-8")
+    controller, client, headers = build_gateway(tmp_path, ["<final>should not be used</final>"])
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "Papers"},
+    ).json()
+    document = client.get(
+        "/library/documents", headers=headers, params={"session_id": session["id"]}
+    ).json()[0]
+    client.patch(
+        f"/sessions/{session['id']}/document-lock",
+        headers=headers,
+        json={"document_id": document["id"]},
+    )
+
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={"session_id": session["id"], "message": "火星农业产量是多少？"},
+    ).json()
+    finished = wait_for_terminal(client, headers, started["run_id"])
+    assert "没有找到足够证据" in finished["answer"]
+    assert controller._agents[session["id"]].model_client.prompts == []
+
+
+def test_full_document_mode_runs_map_reduce_and_emits_coverage_progress(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    path = workspace / "whole-paper.md"
+    path.write_text(
+        "# Definition\nMemory is checkpointed.\n\n# Experiments\n| method | latency |\n| Poppy | 12 ms |\n",
+        encoding="utf-8",
+    )
+    controller, client, headers = build_gateway(
+        tmp_path,
+        ["<final>证据：定义与实验表格均已读取。</final>", "<final>全文综合答案。</final>"],
+    )
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"workspace_root": str(workspace), "title": "Papers"},
+    ).json()
+
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "请综合全文说明定义和实验结果",
+            "document_path": str(path),
+            "full_document": True,
+        },
+    ).json()
+    finished = wait_for_terminal(client, headers, started["run_id"])
+    assert finished["answer"] == "全文综合答案。"
+    prompts = controller._agents[session["id"]].model_client.prompts
+    assert "12 ms" in prompts[0]
+    assert "证据：定义与实验表格均已读取" in prompts[1]
+    progress = client.get(f"/runs/{started['run_id']}/events", headers=headers).json()
+    assert any(event["event_type"] == "run.progress" for event in progress)
 
 
 def test_gateway_allows_only_tauri_origins_for_browser_requests(tmp_path):
@@ -87,12 +198,12 @@ def test_gateway_allows_only_tauri_origins_for_browser_requests(tmp_path):
         headers={
             "Origin": "tauri://localhost",
             "Access-Control-Request-Method": "GET",
-            "Access-Control-Request-Headers": "x-pico-token",
+            "Access-Control-Request-Headers": "x-poppy-token",
         },
     )
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == "tauri://localhost"
-    assert "X-Pico-Token" in allowed.headers["access-control-allow-headers"]
+    assert "X-Poppy-Token" in allowed.headers["access-control-allow-headers"]
 
     denied = client.options(
         "/health",
@@ -187,7 +298,7 @@ def test_gateway_blocks_session_outside_grants_and_limits_tools(tmp_path):
         json={"workspace_root": str(workspace), "title": "Read only"},
     ).json()
     agent = controller._agents[created["id"]]
-    assert set(agent.tools) == {"list_files", "read_file", "search", "delegate"}
+    assert set(agent.tools) == {"list_files", "read_file", "search", "library_search"}
 
 
 def test_gateway_creates_unscoped_chat_session_without_project_grant(tmp_path):
@@ -212,6 +323,230 @@ def test_gateway_creates_unscoped_chat_session_without_project_grant(tmp_path):
         json={"session_id": session["id"], "message": "你是谁？", "attachments": [str(attachment)]},
     ).json()
     assert wait_for_terminal(client, headers, run["run_id"])["answer"] == "好的，我是 Poppy。"
+    prompt = controller._agents[session["id"]].model_client.prompts[-1]
+    assert "[Poppy retrieved document context]" in prompt
+    assert "reference" in prompt
+    history = client.get(f"/sessions/{session['id']}", headers=headers).json()["history"]
+    user_message = next(item for item in history if item["role"] == "user")
+    assert user_message["content"] == "你是谁？"
+    assert "retrieved document context" not in user_message["content"]
+
+
+def test_quick_context_resolves_authorized_document_and_keeps_internal_prompt_out_of_history(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    paper = workspace / "2-poppy.md"
+    paper.write_text(
+        "Poppy uses a layered memory architecture. Session context is restored from bounded checkpoints.\n",
+        encoding="utf-8",
+    )
+    controller, client, headers = build_gateway(tmp_path, ["<final>它使用分层记忆和有界检查点。</final>"])
+    assert client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True}).status_code == 201
+
+    resolved = client.post(
+        "/quick/context/resolve",
+        headers=headers,
+        json={
+            "text": "layered memory architecture. Session context is restored from bounded checkpoints",
+            "source_app": "Preview",
+            "window_title": "2-poppy.pdf",
+        },
+    )
+    assert resolved.status_code == 200
+    context = resolved.json()
+    assert context["mode"] == "document"
+    assert context["document"]["display_name"] == "2-poppy.md"
+
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"title": "文献快问", "session_type": "chat"},
+    ).json()
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "这里的 memory 是怎么设计的？",
+            "quick_context_id": context["context_id"],
+            "quick_intent": "explain",
+        },
+    )
+    assert started.status_code == 202
+    assert wait_for_terminal(client, headers, started.json()["run_id"])["status"] == "completed"
+    prompt = controller._agents[session["id"]].model_client.prompts[-1]
+    assert "[Poppy quick selection context]" in prompt
+    assert "Poppy uses a layered memory architecture" in prompt
+    history = client.get(f"/sessions/{session['id']}", headers=headers).json()["history"]
+    user_message = next(item for item in history if item["role"] == "user")
+    assert user_message["content"] == "这里的 memory 是怎么设计的？"
+
+
+def test_quick_full_document_question_searches_only_the_matched_document(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    target = workspace / "target-paper.md"
+    distractor = workspace / "distractor.md"
+    target.write_text(
+        "Anchor: layered memory keeps active session state.\n"
+        + "filler\n" * 170
+        + "Target evidence: eviction waits for a grace period before permanent removal.\n",
+        encoding="utf-8",
+    )
+    distractor.write_text(
+        "Distractor evidence: eviction has a grace period but this document was not selected.\n",
+        encoding="utf-8",
+    )
+    controller, client, headers = build_gateway(tmp_path, ["<final>目标文献使用 grace period。</final>"])
+    grant = client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True}).json()
+    context = client.post(
+        "/quick/context/resolve",
+        headers=headers,
+        json={
+            "text": "Anchor: layered memory keeps active session state.",
+            "source_app": "Preview",
+            "window_title": "target-paper.pdf",
+        },
+    ).json()
+    assert context["mode"] == "document"
+    session = client.post(
+        "/sessions", headers=headers, json={"title": "文献快问", "session_type": "chat"}
+    ).json()
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "How does the eviction grace period work?",
+            "quick_context_id": context["context_id"],
+            "quick_intent": "ask",
+        },
+    )
+    assert started.status_code == 202
+    assert wait_for_terminal(client, headers, started.json()["run_id"])["status"] == "completed"
+    prompt = controller._agents[session["id"]].model_client.prompts[-1]
+    assert "Target evidence: eviction waits for a grace period" in prompt
+    assert "Distractor evidence" not in prompt
+
+    client.delete(f"/grants/{grant['id']}", headers=headers)
+
+
+def test_quick_context_forbids_path_forgery_and_revocation_removes_document_context(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    paper = workspace / "private-paper.md"
+    paper.write_text(
+        "Selected anchor about layered memory.\nSecret neighboring evidence must disappear after revocation.\n",
+        encoding="utf-8",
+    )
+    controller, client, headers = build_gateway(tmp_path, ["<final>仅根据选区回答。</final>"])
+    grant = client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True}).json()
+    forged = client.post(
+        "/quick/context/resolve",
+        headers=headers,
+        json={"text": "Selected anchor about layered memory.", "path": "/etc/passwd"},
+    )
+    assert forged.status_code == 422
+    context = client.post(
+        "/quick/context/resolve",
+        headers=headers,
+        json={"text": "Selected anchor about layered memory.", "window_title": paper.name},
+    ).json()
+    assert context["mode"] == "document"
+    assert client.delete(f"/grants/{grant['id']}", headers=headers).status_code == 204
+    session = client.post(
+        "/sessions", headers=headers, json={"title": "文献快问", "session_type": "chat"}
+    ).json()
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "解释选区",
+            "quick_context_id": context["context_id"],
+            "quick_intent": "explain",
+        },
+    )
+    assert started.status_code == 202
+    assert wait_for_terminal(client, headers, started.json()["run_id"])["status"] == "completed"
+    prompt = controller._agents[session["id"]].model_client.prompts[-1]
+    assert "Selected anchor about layered memory" in prompt
+    assert "Secret neighboring evidence" not in prompt
+
+
+def test_all_quick_intents_reuse_run_and_stream_event_contract(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    (workspace / "paper.md").write_text(
+        "Layered memory restores session context from bounded checkpoints.\n",
+        encoding="utf-8",
+    )
+    controller, client, headers = build_gateway(
+        tmp_path,
+        [
+            "<final>翻译完成。</final>",
+            "<final>解释完成。</final>",
+            "<final>总结完成。</final>",
+            "<final>问答完成。</final>",
+        ],
+    )
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    context = client.post(
+        "/quick/context/resolve",
+        headers=headers,
+        json={
+            "text": "Layered memory restores session context from bounded checkpoints.",
+            "window_title": "paper.pdf",
+        },
+    ).json()
+    session = client.post(
+        "/sessions", headers=headers, json={"title": "文献快问", "session_type": "chat"}
+    ).json()
+    requirements = {
+        "translate": "忠实翻译",
+        "explain": "先用一句话",
+        "summarize": "概括选区",
+        "ask": "直接回答用户问题",
+    }
+    for intent, requirement in requirements.items():
+        started = client.post(
+            "/runs",
+            headers=headers,
+            json={
+                "session_id": session["id"],
+                "message": f"执行 {intent}",
+                "quick_context_id": context["context_id"],
+                "quick_intent": intent,
+            },
+        )
+        assert started.status_code == 202
+        run_id = started.json()["run_id"]
+        assert wait_for_terminal(client, headers, run_id)["status"] == "completed"
+        events = client.get(f"/runs/{run_id}/events", headers=headers).json()
+        assert events[0]["event_type"] == "run.started"
+        assert events[-1]["event_type"] == "run.completed"
+        assert requirement in controller._agents[session["id"]].model_client.prompts[-1]
+
+
+def test_quick_context_rejects_unknown_or_expired_identifier(tmp_path):
+    _controller, client, headers = build_gateway(tmp_path, ["<final>unused</final>"])
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"title": "文献快问", "session_type": "chat"},
+    ).json()
+    response = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "解释",
+            "quick_context_id": "quick_missing",
+            "quick_intent": "explain",
+        },
+    )
+    assert response.status_code == 422
+    assert "expired" in response.json()["detail"]
 
 
 def test_revoking_a_grant_blocks_new_runs_but_preserves_saved_history(tmp_path):
@@ -271,7 +606,7 @@ def test_downgrading_a_grant_rebuilds_agent_without_write_tools(tmp_path):
     assert wait_for_terminal(client, headers, run["run_id"])["status"] == "completed"
     assert not (workspace / "blocked.txt").exists()
     assert set(controller._agents[session["id"]].tools) == {
-        "list_files", "read_file", "search", "delegate"
+        "list_files", "read_file", "search", "library_search"
     }
 
 
@@ -535,3 +870,46 @@ def test_gateway_approval_and_cancel_endpoints_control_active_runs(tmp_path):
     cancelled = client.post(f"/runs/{shell_run['run_id']}/cancel", headers=headers)
     assert cancelled.status_code == 202
     assert wait_for_terminal(client, headers, shell_run["run_id"], timeout=3)["status"] == "cancelled"
+
+
+def test_reader_run_locks_retrieval_to_requested_document(tmp_path):
+    library = tmp_path / "papers"
+    library.mkdir()
+    target = library / "target.txt"
+    distractor = library / "distractor.txt"
+    target.write_text("Shared topic. TARGET_ONLY evidence about bounded memory.\n", encoding="utf-8")
+    distractor.write_text("Shared topic. DISTRACTOR_ONLY unrelated evidence.\n", encoding="utf-8")
+    controller, client, headers = build_gateway(tmp_path, ["<final>reader answer</final>"])
+
+    assert client.post(
+        "/grants",
+        headers=headers,
+        json={"path": str(library), "can_read": True, "can_write": False, "can_shell": False},
+    ).status_code == 201
+    assert client.post(
+        "/library/sources",
+        headers=headers,
+        json={"path": str(library)},
+    ).status_code == 201
+    session = client.post(
+        "/sessions",
+        headers=headers,
+        json={"title": "阅读 target.txt", "session_type": "chat"},
+    ).json()
+
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={
+            "session_id": session["id"],
+            "message": "What does the shared topic say?",
+            "attachments": [str(target)],
+            "document_path": str(target),
+        },
+    )
+    assert started.status_code == 202
+    assert wait_for_terminal(client, headers, started.json()["run_id"])["status"] == "completed"
+
+    prompt = controller._agents[session["id"]].model_client.prompts[0]
+    assert "TARGET_ONLY" in prompt
+    assert "DISTRACTOR_ONLY" not in prompt

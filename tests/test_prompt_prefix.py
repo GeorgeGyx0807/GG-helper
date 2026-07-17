@@ -1,6 +1,6 @@
-from pico.prompt_prefix import build_prompt_prefix, tool_signature
-from pico.tools import build_tool_registry
-from pico.workspace import WorkspaceContext
+from poppy.prompt_prefix import build_prompt_prefix, tool_signature
+from poppy.tools import build_tool_registry
+from poppy.workspace import WorkspaceContext
 
 
 class _Agent:
@@ -29,9 +29,14 @@ def test_build_prompt_prefix_renders_tools_and_workspace_metadata(tmp_path):
     prefix = build_prompt_prefix(workspace=workspace, tools=tools, built_at="2026-06-02T00:00:00+08:00")
 
     assert "You are Poppy" in prefix.text
-    assert "Pico" not in prefix.text
+    assert ("Pi" + "co") not in prefix.text
     assert "Tools:" in prefix.text
     assert "- read_file(" in prefix.text
+    assert "synthesize a direct answer" in prefix.text
+    assert "must never replace the answer" in prefix.text
+    assert "do not start with search results" in prefix.text
+    assert "Default to Simplified Chinese" in prefix.text
+    assert "tool names" in prefix.text
     assert "Workspace:" in prefix.text
     assert prefix.hash
     assert prefix.workspace_fingerprint == workspace.fingerprint()

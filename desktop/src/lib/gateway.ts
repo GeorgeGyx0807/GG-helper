@@ -1,8 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApprovalRule,
+  AuditEvent,
+  FeishuSettings,
   Grant,
+  LibraryDocument,
+  LibrarySearchResult,
+  LibrarySource,
   MemoryItem,
+  QuickContextResult,
+  QuickIntent,
   RunEvent,
   RunSnapshot,
   SessionDetail,
@@ -13,11 +20,11 @@ import type {
 export type GatewayInfo = { base_url: string; token: string };
 
 export async function resolveGatewayInfo(timeoutMs = 60_000): Promise<GatewayInfo> {
-  const configuredUrl = import.meta.env.VITE_PICO_GATEWAY_URL;
+  const configuredUrl = import.meta.env.VITE_POPPY_GATEWAY_URL;
   if (configuredUrl) {
     return {
       base_url: configuredUrl,
-      token: import.meta.env.VITE_PICO_GATEWAY_TOKEN || "",
+      token: import.meta.env.VITE_POPPY_GATEWAY_TOKEN || "",
     };
   }
 
@@ -53,29 +60,41 @@ export class GatewayClient {
     throw lastError instanceof Error ? lastError : new Error("Poppy local gateway did not start");
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.info.base_url}${path}`, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        "X-Pico-Token": this.info.token,
-        ...(init.headers || {}),
-      },
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({ detail: response.statusText }));
-      throw new Error(body.detail || `Gateway request failed (${response.status})`);
+  private async request<T>(path: string, init: RequestInit = {}, timeoutMs = 15_000): Promise<T> {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), Math.max(250, timeoutMs));
+    try {
+      const response = await fetch(`${this.info.base_url}${path}`, {
+        ...init,
+        signal: init.signal || controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Poppy-Token": this.info.token,
+          ...(init.headers || {}),
+        },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(body.detail || `Gateway request failed (${response.status})`);
+      }
+      if (response.status === 204) return undefined as T;
+      return response.json() as Promise<T>;
+    } catch (reason) {
+      if (reason instanceof DOMException && reason.name === "AbortError") {
+        throw new Error(`Poppy 本地服务请求超时（${path}）`);
+      }
+      throw reason;
+    } finally {
+      window.clearTimeout(timer);
     }
-    if (response.status === 204) return undefined as T;
-    return response.json() as Promise<T>;
   }
 
-  health() {
-    return this.request<{ status: string }>("/health");
+  health(timeoutMs = 2_000) {
+    return this.request<{ status: string }>("/health", {}, timeoutMs);
   }
 
-  sessions() {
-    return this.request<SessionSummary[]>("/sessions");
+  sessions(timeoutMs = 15_000) {
+    return this.request<SessionSummary[]>("/sessions", {}, timeoutMs);
   }
 
   session(id: string) {
@@ -100,10 +119,37 @@ export class GatewayClient {
     return this.request<void>(`/sessions/${id}`, { method: "DELETE" });
   }
 
-  startRun(session_id: string, message: string, attachments: string[] = []) {
+  setDocumentLock(id: string, document_id = "") {
+    return this.request<SessionSummary>(`/sessions/${id}/document-lock`, {
+      method: "PATCH",
+      body: JSON.stringify({ document_id }),
+    });
+  }
+
+  startRun(
+    session_id: string,
+    message: string,
+    attachments: string[] = [],
+    quick?: { context_id?: string; intent?: QuickIntent; document_path?: string; full_document?: boolean },
+  ) {
     return this.request<RunSnapshot>("/runs", {
       method: "POST",
-      body: JSON.stringify({ session_id, message, attachments }),
+      body: JSON.stringify({
+        session_id,
+        message,
+        attachments,
+        quick_context_id: quick?.context_id || "",
+        quick_intent: quick?.intent || "ask",
+        document_path: quick?.document_path || "",
+        full_document: Boolean(quick?.full_document),
+      }),
+    });
+  }
+
+  resolveQuickContext(text: string, source_app = "", window_title = "") {
+    return this.request<QuickContextResult>("/quick/context/resolve", {
+      method: "POST",
+      body: JSON.stringify({ text, source_app, window_title }),
     });
   }
 
@@ -170,6 +216,25 @@ export class GatewayClient {
     });
   }
 
+  feishuSettings() {
+    return this.request<FeishuSettings>("/feishu/settings");
+  }
+
+  updateFeishuSettings(values: Partial<FeishuSettings>) {
+    return this.request<FeishuSettings>("/feishu/settings", {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    });
+  }
+
+  restartFeishu() {
+    return this.request<FeishuSettings>("/feishu/restart", { method: "POST" }, 30_000);
+  }
+
+  deleteFeishuSession(id: string) {
+    return this.request<FeishuSettings>(`/feishu/sessions/${id}`, { method: "DELETE" });
+  }
+
   grants() {
     return this.request<Grant[]>("/grants");
   }
@@ -213,5 +278,41 @@ export class GatewayClient {
 
   deleteApprovalRule(id: string) {
     return this.request<void>(`/approval-rules/${id}`, { method: "DELETE" });
+  }
+
+  librarySources() {
+    return this.request<LibrarySource[]>("/library/sources");
+  }
+
+  libraryDocuments(sessionId = "") {
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    return this.request<LibraryDocument[]>(`/library/documents${query}`);
+  }
+
+  addLibrarySource(path: string) {
+    return this.request<LibrarySource>("/library/sources", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
+  }
+
+  deleteLibrarySource(id: string) {
+    return this.request<void>(`/library/sources/${id}`, { method: "DELETE" });
+  }
+
+  auditEvents(limit = 100) {
+    return this.request<AuditEvent[]>(`/audit-events?limit=${limit}`);
+  }
+
+  reindexLibrary(sourceId = "") {
+    const query = sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : "";
+    return this.request<{ source_id: string; path: string; documents: number }[]>(`/library/reindex${query}`, { method: "POST" });
+  }
+
+  searchLibrary(query: string, limit = 20) {
+    return this.request<LibrarySearchResult[]>("/library/search", {
+      method: "POST",
+      body: JSON.stringify({ query, limit }),
+    });
   }
 }

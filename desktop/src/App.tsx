@@ -1,7 +1,10 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ArrowUp,
+  BookOpenText,
   BrainCircuit,
   Bot,
   ChevronDown,
@@ -19,25 +22,28 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
 import poppyMark from "./assets/poppy-mark.svg";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar } from "./components/Sidebar";
-import { ToolCard } from "./components/ToolCard";
 import { GatewayClient, resolveGatewayInfo } from "./lib/gateway";
 import type { GatewayInfo } from "./lib/gateway";
-import type { ApprovalRule, Grant, HistoryItem, MemoryItem, RunEvent, SessionSummary, Settings, ToolCall } from "./types";
+import type { ApprovalRule, AuditEvent, FeishuSettings, Grant, HistoryItem, LibraryDocument, LibrarySource, MemoryItem, RunEvent, SessionSummary, Settings, ToolCall } from "./types";
+
+const PdfReader = lazy(() => import("./reader/PdfReader").then((module) => ({ default: module.PdfReader })));
 
 type ApprovalPrompt = { approvalId: string; toolName: string; arguments: Record<string, unknown> };
 type RetryRequest = { content: string; attachments: string[] };
 type DraftType = "chat" | "project";
 
 const modelOptions = [
-  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro", note: "高质量" },
-  { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash", note: "更快" },
+  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro", note: "高质量", baseUrl: "https://api.deepseek.com/anthropic" },
+  { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash", note: "更快", baseUrl: "https://api.deepseek.com/anthropic" },
+  { value: "qwen3.7-plus", label: "Qwen 3.7 Plus", note: "通用能力", baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic" },
+  { value: "qwen3.6-flash", label: "Qwen 3.6 Flash", note: "更快", baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic" },
 ];
 
 const defaultSettings: Settings = {
@@ -46,6 +52,59 @@ const defaultSettings: Settings = {
   timeout: 300,
   api_key_configured: false,
 };
+
+const defaultFeishuSettings: FeishuSettings = {
+  feishu_enabled: false,
+  feishu_app_id: "",
+  feishu_secret_configured: false,
+  feishu_allowed_users: [],
+  feishu_allowed_chats: [],
+  feishu_require_mention: true,
+  feishu_cloud_enabled: true,
+  feishu_workspace_root: "",
+  feishu_max_file_mb: 50,
+  feishu_pairing_code: "",
+  feishu_status: "disabled",
+  feishu_error: "",
+  feishu_connected_at: "",
+  feishu_bot_name: "",
+  feishu_bot_open_id: "",
+  feishu_cloud_scope_ids: [],
+  feishu_cloud_permission_url: "",
+  feishu_sessions: [],
+};
+
+function modelSecretProvider(settings: Pick<Settings, "model" | "base_url">): "deepseek" | "dashscope" {
+  return settings.model.toLowerCase().startsWith("qwen")
+    || settings.base_url.includes("dashscope")
+    || settings.base_url.includes("maas.aliyuncs.com")
+    ? "dashscope"
+    : "deepseek";
+}
+
+function sanitizeAssistantContent(value: string, streaming = false) {
+  const text = String(value || "");
+  // Protocol blocks belong to the tool cards, never to the conversation.
+  // If a model narrates before emitting <tool>, discard the whole streamed
+  // attempt; a later message.completed event will supply the real answer.
+  if (/<tool\b/i.test(text) || /<\/tool>/i.test(text)) return "";
+  const finalStart = text.indexOf("<final>");
+  if (finalStart >= 0) {
+    const body = text.slice(finalStart + "<final>".length);
+    const finalEnd = body.indexOf("</final>");
+    return finalEnd >= 0 ? body.slice(0, finalEnd) : streaming ? body : body.trim();
+  }
+  return text.replace(/<\/?final>/g, "");
+}
+
+function visibleHistory(history: HistoryItem[]) {
+  return history
+    .filter((item) => item.role !== "tool")
+    .map((item) => item.role === "assistant"
+      ? { ...item, content: sanitizeAssistantContent(item.content) }
+      : item)
+    .filter((item) => item.role !== "assistant" || Boolean(item.content.trim()));
+}
 
 function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
@@ -65,8 +124,12 @@ function App() {
   const [tools, setTools] = useState<ToolCall[]>([]);
   const [grants, setGrants] = useState<Grant[]>([]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
+  const [feishuSettings, setFeishuSettings] = useState<FeishuSettings>(defaultFeishuSettings);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [approvalRules, setApprovalRules] = useState<ApprovalRule[]>([]);
+  const [librarySources, setLibrarySources] = useState<LibrarySource[]>([]);
+  const [libraryDocuments, setLibraryDocuments] = useState<LibraryDocument[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<string[]>([]);
@@ -83,9 +146,12 @@ function App() {
   const [renamingSession, setRenamingSession] = useState<{ id: string; title: string }>();
   const [renameValue, setRenameValue] = useState("");
   const [lastRequest, setLastRequest] = useState<RetryRequest>();
+  const [readerPath, setReaderPath] = useState("");
   const disconnectRef = useRef<(() => void) | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerMenuRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const selected = useMemo(() => sessions.find((session) => session.id === selectedId), [sessions, selectedId]);
   const activeProjectName = activeWorkspace?.split(/[\\/]/).filter(Boolean).pop() || "项目";
@@ -93,6 +159,26 @@ function App() {
   useEffect(() => {
     void initialize();
     return () => disconnectRef.current?.();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const openFirstPdf = (paths: string[]) => {
+      const pdf = paths.find((path) => path.toLowerCase().endsWith(".pdf"));
+      if (pdf) setReaderPath(pdf);
+    };
+    void invoke<string[]>("take_opened_pdf_paths")
+      .then((paths) => { if (!cancelled) openFirstPdf(paths); })
+      .catch(() => undefined);
+    void listen<string[]>("open-pdf", ({ payload }) => openFirstPdf(payload)).then((cleanup) => {
+      if (cancelled) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -117,6 +203,67 @@ function App() {
     return () => document.removeEventListener("mousedown", close);
   }, [composerMenuOpen]);
 
+  useEffect(() => {
+    if (!settingsOpen || !client) return;
+    let stopped = false;
+    const refresh = () => {
+      void client.feishuSettings().then((next) => {
+        if (!stopped) setFeishuSettings(next);
+      }).catch(() => undefined);
+      void client.librarySources().then((next) => {
+        if (!stopped) setLibrarySources(next);
+      }).catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [settingsOpen, client]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen("quick-capture", () => {
+      if (activeRun) return;
+      clearTaskDraft("chat");
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    }).then((cleanup) => { if (cancelled) cleanup(); else unlisten = cleanup; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [activeRun]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const isInsideComposer = (position: { x: number; y: number }) => {
+      const rect = composerRef.current?.getBoundingClientRect();
+      if (!rect) return false;
+      const scale = window.devicePixelRatio || 1;
+      const x = position.x / scale;
+      const y = position.y / scale;
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    };
+    void getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === "enter" || payload.type === "over") {
+        setIsDraggingOver(Boolean(selectedId || taskDraft) && isInsideComposer(payload.position));
+        return;
+      }
+      if (payload.type === "leave") {
+        setIsDraggingOver(false);
+        return;
+      }
+      setIsDraggingOver(false);
+      if ((selectedId || taskDraft) && isInsideComposer(payload.position) && payload.paths.length) {
+        setAttachments((current) => [...new Set([...current, ...payload.paths])]);
+        return;
+      }
+      const pdf = payload.paths.find((path) => path.toLowerCase().endsWith(".pdf"));
+      if (pdf) setReaderPath(pdf);
+    }).then((cleanup) => { if (cancelled) cleanup(); else unlisten = cleanup; });
+    return () => { cancelled = true; unlisten?.(); setIsDraggingOver(false); };
+  }, [selectedId, taskDraft]);
+
   async function initialize() {
     setLoading(true);
     try {
@@ -134,12 +281,12 @@ function App() {
   async function connectGateway(info: GatewayInfo) {
       const gateway = new GatewayClient(info);
       await gateway.waitUntilHealthy(info.token ? 30_000 : 750);
-      let snapshot: [SessionSummary[], Grant[], Settings, MemoryItem[], ApprovalRule[]] | undefined;
+      let snapshot: [SessionSummary[], Grant[], Settings, FeishuSettings, MemoryItem[], ApprovalRule[], LibrarySource[], AuditEvent[]] | undefined;
       let lastError: unknown;
       for (let attempt = 0; attempt < 8; attempt += 1) {
         try {
           snapshot = await Promise.all([
-            gateway.sessions(), gateway.grants(), gateway.settings(), gateway.memories(), gateway.approvalRules(),
+            gateway.sessions(), gateway.grants(), gateway.settings(), gateway.feishuSettings(), gateway.memories(), gateway.approvalRules(), gateway.librarySources(), gateway.auditEvents(),
           ]);
           break;
         } catch (reason) {
@@ -148,30 +295,33 @@ function App() {
         }
       }
       if (!snapshot) throw lastError instanceof Error ? lastError : new Error("Poppy 无法加载本地数据");
-      const [sessionList, grantList, appSettings, memoryList, ruleList] = snapshot;
+      const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList] = snapshot;
       disconnectRef.current?.();
       setClient(gateway);
       setConnected(true);
       setSessions(sessionList);
       setGrants(grantList);
       setSettings(appSettings);
+      setFeishuSettings(feishu);
       setMemories(memoryList);
       setApprovalRules(ruleList);
+      setLibrarySources(sourceList);
+      setAuditEvents(auditList);
       if (sessionList[0]) await selectSession(gateway, sessionList[0].id);
       else if (grantList[0]) setActiveWorkspace(grantList[0].path);
   }
 
-  async function saveApiKey(apiKey: string) {
+  async function saveApiKey(apiKey: string, provider: "deepseek" | "dashscope" | "feishu") {
     setLoading(true);
     let keyStored = false;
     try {
-      const info = await invoke<GatewayInfo>("set_api_key", { apiKey });
+      const info = await invoke<GatewayInfo>("set_api_key", { apiKey, provider });
       keyStored = true;
       await connectGateway(info);
       setError("");
     } catch (reason) {
       const failure = keyStored
-        ? new Error("API Key 已保存，但 Poppy 无法重新连接，请重试或重启应用。")
+        ? new Error("密钥已保存，但 Poppy 无法重新连接，请重试或重启应用。")
         : reason instanceof Error ? reason : new Error(String(reason));
       setError(failure.message);
       throw failure;
@@ -180,10 +330,10 @@ function App() {
     }
   }
 
-  async function deleteApiKey() {
+  async function deleteApiKey(provider: "deepseek" | "dashscope" | "feishu") {
     setLoading(true);
     try {
-      const info = await invoke<GatewayInfo>("delete_api_key");
+      const info = await invoke<GatewayInfo>("delete_api_key", { provider });
       await connectGateway(info);
       setError("");
     } catch (reason) {
@@ -196,23 +346,30 @@ function App() {
 
   async function refreshMeta() {
     if (!client) return;
-    const [sessionList, grantList, appSettings, memoryList, ruleList] = await Promise.all([
-      client.sessions(), client.grants(), client.settings(), client.memories(), client.approvalRules(),
+    const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList] = await Promise.all([
+      client.sessions(), client.grants(), client.settings(), client.feishuSettings(), client.memories(), client.approvalRules(), client.librarySources(), client.auditEvents(),
     ]);
     setSessions(sessionList);
     setGrants(grantList);
     setSettings(appSettings);
+    setFeishuSettings(feishu);
     setMemories(memoryList);
     setApprovalRules(ruleList);
+    setLibrarySources(sourceList);
+    setAuditEvents(auditList);
   }
 
   async function selectSession(gateway: GatewayClient, id: string) {
     disconnectRef.current?.();
-    const detail = await gateway.session(id);
+    const [detail, documents] = await Promise.all([
+      gateway.session(id),
+      gateway.libraryDocuments(id),
+    ]);
     setSelectedId(id);
     setTaskDraft(false);
     setActiveWorkspace(detail.session_type === "chat" ? undefined : detail.workspace_root);
-    setMessages(detail.history.filter((item) => item.role !== "tool"));
+    setMessages(visibleHistory(detail.history));
+    setLibraryDocuments(documents);
     setTools(
       detail.history.filter((item) => item.role === "tool").map((item, index) => ({
         key: `history-${index}`,
@@ -223,6 +380,17 @@ function App() {
       })),
     );
     setActiveRun(undefined);
+  }
+
+  async function changeDocumentLock(documentId: string) {
+    if (!client || !selectedId || activeRun) return;
+    try {
+      const updated = await client.setDocumentLock(selectedId, documentId);
+      setSessions((current) => current.map((session) => session.id === selectedId ? updated : session));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }
 
   async function chooseFolder(forNewSession = false) {
@@ -346,10 +514,44 @@ function App() {
     }
   }
 
+  async function choosePdfReader() {
+    try {
+      const result = await open({
+        directory: false,
+        multiple: false,
+        title: "在 Poppy 中阅读 PDF",
+        filters: [{ name: "PDF 文献", extensions: ["pdf"] }],
+      });
+      if (typeof result === "string") setReaderPath(result);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function chooseLibrarySource() {
+    if (!client) return;
+    try {
+      const result = await open({ directory: true, multiple: false, title: "选择要加入个人资料库的文件夹" });
+      const path = typeof result === "string" ? result : null;
+      if (!path) return;
+      await client.addLibrarySource(path);
+      await refreshMeta();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
   async function chooseModel(model: string) {
     if (!client) return;
     try {
-      setSettings(await client.updateSettings({ model }));
+      const option = modelOptions.find((item) => item.value === model);
+      const next = await client.updateSettings({ model, ...(option ? { base_url: option.baseUrl } : {}) });
+      setSettings(next);
+      const info = await invoke<GatewayInfo>("configure_secret_usage", {
+        provider: modelSecretProvider(next),
+        feishuEnabled: feishuSettings.feishu_enabled,
+      });
+      await connectGateway(info);
       setModelMenuOpen(false);
       setComposerMenuOpen(false);
     } catch (reason) {
@@ -371,15 +573,16 @@ function App() {
       setMessages((current) => {
         const next = [...current];
         const last = next[next.length - 1];
-        if (last?.role === "assistant") last.content += String(payload.delta || "");
-        else next.push({ role: "assistant", content: String(payload.delta || "") });
+        const delta = String(payload.delta || "");
+        if (last?.role === "assistant") last.content = sanitizeAssistantContent(last.content + delta, true);
+        else next.push({ role: "assistant", content: sanitizeAssistantContent(delta, true) });
         return next;
       });
     } else if (event.event_type === "message.completed") {
       setMessages((current) => {
         const next = [...current];
         const last = next[next.length - 1];
-        if (last?.role === "assistant") last.content = String(payload.content || "");
+        if (last?.role === "assistant") last.content = sanitizeAssistantContent(String(payload.content || ""));
         return next;
       });
     } else if (event.event_type === "tool.requested") {
@@ -425,8 +628,13 @@ function App() {
         setActiveRun(undefined);
         setTaskDraft(false);
         try {
-          const detail = await client.session(sessionId);
-          setMessages(detail.history.filter((item) => item.role !== "tool"));
+          const [detail, documents] = await Promise.all([
+            client.session(sessionId),
+            client.libraryDocuments(sessionId),
+          ]);
+          setMessages(visibleHistory(detail.history));
+          setSessions((current) => current.map((session) => session.id === sessionId ? detail : session));
+          setLibraryDocuments(documents);
         } catch { /* keep streamed state */ }
       });
     } catch (reason) {
@@ -555,6 +763,9 @@ function App() {
             <strong>{selected?.title || (activeWorkspace ? `${activeProjectName} 项目` : "Poppy")}</strong>
             <span>{selected?.session_type === "chat" ? "" : selected?.workspace_root || activeWorkspace || "你的桌面个人助手"}</span>
           </div>
+          <button className="icon-button" onClick={() => void choosePdfReader()} aria-label="打开 PDF 阅读器" title="打开 PDF 阅读器">
+            <BookOpenText size={18} />
+          </button>
           <button
             className="icon-button theme-toggle"
             onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
@@ -571,17 +782,17 @@ function App() {
 
         <div className="conversation" ref={scrollRef}>
           {loading ? (
-            <div className="center-state"><div className="pico-orb pulse"><img src={poppyMark} alt="Poppy" /></div><p>正在启动 Poppy…</p></div>
+            <div className="center-state"><div className="poppy-orb pulse"><img src={poppyMark} alt="Poppy" /></div><p>正在启动 Poppy…</p></div>
           ) : !connected ? (
             <div className="center-state error-state">
-              <div className="pico-orb"><WifiOff size={25} /></div>
+              <div className="poppy-orb"><WifiOff size={25} /></div>
               <h2>助手暂时不可用</h2>
               <p>{error || "Poppy 无法连接本地运行服务。"}</p>
               <button className="secondary-button" onClick={() => void initialize()}>重试</button>
             </div>
           ) : !settings.api_key_configured ? (
             <div className="center-state welcome-state">
-              <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+              <div className="poppy-orb"><img src={poppyMark} alt="Poppy" /></div>
               <h1>连接 DeepSeek</h1>
               <p>请在设置中填写 DeepSeek API 密钥。密钥只保存在 macOS 钥匙串中。</p>
               <button className="primary-action compact" onClick={() => setSettingsOpen(true)}>打开设置</button>
@@ -589,7 +800,7 @@ function App() {
           ) : !selectedId ? (
             taskDraft ? (
               <div className="center-state task-state">
-                <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+                <div className="poppy-orb"><img src={poppyMark} alt="Poppy" /></div>
                 <h1>我们开始做什么？</h1>
                 <p>{draftType === "project" && activeWorkspace ? `将在“${activeProjectName}”项目中开始任务` : "描述你想完成的事情，发送后才会创建任务。"}</p>
                 <div className="task-suggestions">
@@ -606,7 +817,7 @@ function App() {
                 </div>
               </div>
             ) : <div className="center-state welcome-state">
-              <div className="pico-orb"><img src={poppyMark} alt="Poppy" /></div>
+              <div className="poppy-orb"><img src={poppyMark} alt="Poppy" /></div>
               <h1>{activeWorkspace ? `在“${activeProjectName}”项目中开始工作` : "今天想做什么？"}</h1>
               <p>{activeWorkspace ? "新建对话后，Poppy 只会在这个项目文件夹中工作。" : "Poppy 只会访问你明确授权的文件夹。"}</p>
               {!grants.length ? (
@@ -624,11 +835,14 @@ function App() {
                     <div className="message-role">{message.role === "user" ? "你" : "Poppy"}</div>
                     {message.role === "assistant" ? (
                       message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <div className="typing"><i /><i /><i /></div>
-                    ) : <><p>{message.content}</p>{!!message.attachments?.length && <div className="message-attachments">{message.attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}</span>)}</div>}</>}
+                    ) : <><p>{message.content}</p>{!!message.attachments?.length && <div className="message-attachments">{message.attachments.map((path) => (
+                      path.toLowerCase().endsWith(".pdf")
+                        ? <button key={path} onClick={() => setReaderPath(path)} title="在内置阅读器中打开"><BookOpenText size={12} />{path.split("/").pop()}</button>
+                        : <span key={path}><Paperclip size={12} />{path.split("/").pop()}</span>
+                    ))}</div>}</>}
                   </div>
                 </article>
               ))}
-              {!!tools.length && <div className="tool-stack">{tools.map((tool) => <ToolCard key={tool.key} tool={tool} />)}</div>}
             </div>
           )}
         </div>
@@ -636,19 +850,36 @@ function App() {
         {connected && (selectedId || taskDraft) && (
           <div className="composer-wrap">
             {error && <div className="inline-error"><span>{error}</span>{lastRequest && !activeRun && <button onClick={() => void retryLastRequest()}>重试</button>}</div>}
+            {selectedId && <div className={`document-lock-bar ${selected?.locked_document ? "locked" : ""}`}>
+              <BookOpenText size={14} />
+              <span>{selected?.locked_document ? "当前锁定文档" : "文档范围"}</span>
+              <select
+                value={selected?.locked_document?.id || ""}
+                onChange={(event) => void changeDocumentLock(event.target.value)}
+                disabled={Boolean(activeRun)}
+                title="锁定后，普通问题只会从这一篇文档取证"
+              >
+                <option value="">自动匹配（可能跨资料库）</option>
+                {libraryDocuments.map((document) => (
+                  <option value={document.id} key={document.id}>{document.display_name}</option>
+                ))}
+              </select>
+              <small>{selected?.locked_document ? "回答仅从此文档检索；可随时切换或解除" : "写出完整文件名时会自动锁定"}</small>
+            </div>}
             {taskDraft && <div className="draft-context-bar">
               <button className="draft-context-button" onClick={() => grants.length ? setChoosingWorkspace(true) : void chooseFolder(false)}>
                 <FolderOpen size={14} /> {activeWorkspace ? activeProjectName : "选择项目"}<ChevronDown size={13} />
               </button>
               <span>{draftType === "project" ? "项目任务" : "普通任务"}</span>
             </div>}
-            <div className="composer">
+            <div className="composer" ref={composerRef}>
               <div className="composer-menu-wrap" ref={composerMenuRef}>
                 <button className="composer-plus" onClick={() => { setComposerMenuOpen((open) => !open); setModelMenuOpen(false); }} aria-label="添加"><Plus size={18} /></button>
                 {composerMenuOpen && <div className="composer-menu">
                   <div className="composer-menu-header"><span className="composer-menu-title">添加</span><button className="composer-menu-close" onClick={() => { setComposerMenuOpen(false); setModelMenuOpen(false); }} aria-label="收起菜单"><ChevronDown size={16} /></button></div>
                   <button onClick={() => { setComposerMenuOpen(false); void chooseAttachments(false); }}><Paperclip size={15} />选择文件</button>
                   <button onClick={() => { setComposerMenuOpen(false); void chooseAttachments(true); }}><FolderOpen size={15} />选择文件夹</button>
+                  <button onClick={() => { setComposerMenuOpen(false); void choosePdfReader(); }}><BookOpenText size={15} />打开 PDF 阅读器</button>
                   <button onClick={() => { setComposerMenuOpen(false); setError("插件入口已预留，插件中心将在后续版本接入。"); }}><Puzzle size={15} />插件</button>
                   <button onClick={() => setModelMenuOpen((open) => !open)}><BrainCircuit size={15} />选择模型 <ChevronDown size={13} /></button>
                   {modelMenuOpen && <div className="model-menu">
@@ -677,10 +908,17 @@ function App() {
               >
                 {!!attachments.length && <div className="composer-attachments">{attachments.map((path) => <span key={path}><Paperclip size={12} />{path.split("/").pop()}<button aria-label="移除附件" onClick={() => setAttachments((current) => current.filter((item) => item !== path))}><X size={12} /></button></span>)}</div>}
                 <textarea
+                  ref={inputRef}
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); }
+                    // 中文输入法确认候选字时也会触发 Enter；组合输入期间不能提交消息。
+                    // keyCode 229 是 Safari/macOS 输入法在 isComposing 不稳定时的兜底标记。
+                    const composing = event.nativeEvent.isComposing || event.keyCode === 229;
+                    if (event.key === "Enter" && !event.shiftKey && !composing) {
+                      event.preventDefault();
+                      void sendMessage();
+                    }
                   }}
                   placeholder="输入消息…"
                   rows={1}
@@ -709,7 +947,7 @@ function App() {
             <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
             <div className="approval-actions">
               <button className="ghost-button" onClick={() => void resolveApproval("deny")}>拒绝</button>
-              {approval.toolName !== "run_shell" && <button className="secondary-button" onClick={() => void resolveApproval("allow_always")}>始终允许此文件</button>}
+              {approval.toolName !== "run_shell" && <button className="secondary-button" onClick={() => void resolveApproval("allow_always")}>始终允许此范围</button>}
               <button className="primary-button" onClick={() => void resolveApproval("allow_once")}>本次允许</button>
             </div>
           </section>
@@ -776,16 +1014,59 @@ function App() {
         </div>
       )}
 
+      {readerPath && client && (
+        <Suspense fallback={<div className="reader-loading-overlay">正在加载 PDF 阅读器…</div>}>
+          <PdfReader
+            path={readerPath}
+            client={client}
+            onClose={() => setReaderPath("")}
+            onSessionCreated={() => void refreshMeta()}
+          />
+        </Suspense>
+      )}
+
       {settingsOpen && (
         <SettingsPanel
           settings={settings}
+          feishu={feishuSettings}
           grants={grants}
           memories={memories}
           approvalRules={approvalRules}
+          librarySources={librarySources}
+          auditEvents={auditEvents}
           onClose={() => setSettingsOpen(false)}
-          onSaveSettings={async (values) => { if (client) setSettings(await client.updateSettings(values)); }}
+          onSaveSettings={async (values) => {
+            if (!client) return;
+            const next = await client.updateSettings(values);
+            setSettings(next);
+            const info = await invoke<GatewayInfo>("configure_secret_usage", {
+              provider: modelSecretProvider(next),
+              feishuEnabled: feishuSettings.feishu_enabled,
+            });
+            await connectGateway(info);
+          }}
           onSaveApiKey={saveApiKey}
           onDeleteApiKey={deleteApiKey}
+          onSaveFeishuSettings={async (values) => {
+            if (!client) throw new Error("Poppy 本地服务不可用");
+            const next = await client.updateFeishuSettings(values);
+            setFeishuSettings(next);
+            const info = await invoke<GatewayInfo>("configure_secret_usage", {
+              provider: modelSecretProvider(settings),
+              feishuEnabled: next.feishu_enabled,
+            });
+            await connectGateway(info);
+          }}
+          onSaveFeishuSecret={(secret) => saveApiKey(secret, "feishu")}
+          onDeleteFeishuSecret={() => deleteApiKey("feishu")}
+          onRestartFeishu={async () => {
+            if (!client) throw new Error("Poppy 本地服务不可用");
+            setFeishuSettings(await client.restartFeishu());
+          }}
+          onDeleteFeishuSession={async (id) => {
+            if (!client) throw new Error("Poppy 本地服务不可用");
+            setFeishuSettings(await client.deleteFeishuSession(id));
+          }}
           onTestConnection={async () => {
             if (!client) throw new Error("Poppy 本地服务不可用");
             return client.testConnection();
@@ -796,6 +1077,9 @@ function App() {
           onDeleteMemory={async (id) => { if (client) { await client.deleteMemory(id); await refreshMeta(); } }}
           onUpdateMemory={async (id, content) => { if (client) { await client.updateMemory(id, content); await refreshMeta(); } }}
           onDeleteApprovalRule={async (id) => { if (client) { await client.deleteApprovalRule(id); await refreshMeta(); } }}
+          onAddLibrarySource={() => void chooseLibrarySource()}
+          onDeleteLibrarySource={async (id) => { if (client) { await client.deleteLibrarySource(id); await refreshMeta(); } }}
+          onReindexLibrary={async (id) => { if (client) { await client.reindexLibrary(id); await refreshMeta(); } }}
         />
       )}
     </div>

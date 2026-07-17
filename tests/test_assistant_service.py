@@ -5,14 +5,14 @@ import time
 
 import pytest
 
-from pico import AssistantService, FakeModelClient, Pico, SessionStore, WorkspaceContext
+from poppy import AssistantService, FakeModelClient, Poppy, SessionStore, WorkspaceContext
 
 
 def build_agent(tmp_path, outputs, **kwargs):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     workspace = WorkspaceContext.build(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
-    return Pico(
+    store = SessionStore(tmp_path / ".poppy" / "sessions")
+    return Poppy(
         model_client=FakeModelClient(outputs),
         workspace=workspace,
         session_store=store,

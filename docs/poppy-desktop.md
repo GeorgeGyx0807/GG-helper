@@ -54,7 +54,7 @@ desktop/src-tauri/target/release/bundle/macos/Poppy.app
 
 ```bash
 uv run pytest tests -q
-uv run ruff check pico tests scripts
+uv run ruff check poppy tests scripts
 cd desktop && npm run build
 cd desktop/src-tauri && cargo fmt --check && cargo check
 ```

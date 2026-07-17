@@ -30,8 +30,8 @@ htmlcov/
 # Local scratch space
 tmp/
 .worktrees/
-.pico/
-.mini-pico/
+.poppy/
+.mini-poppy/
 artifacts/
 release/
 readme_intro_locked/
@@ -54,5 +54,7 @@ docs/*
 .DS_Store
 
 # Packaging metadata
-pico.egg-info/
+poppy.egg-info/
 /Poppy.app/
+/Poppy-*.app.backup/
+/resume/
