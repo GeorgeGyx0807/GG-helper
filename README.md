@@ -2,7 +2,7 @@
 
 Poppy 是一个同时提供 macOS 桌面端和终端 CLI 的本地优先个人助手。它支持多模型接入、流式聊天、会话恢复、明确的文件夹授权、文档知识库、受控工具执行、个人记忆、系统托盘和全局快捷键。
 
-桌面版的安装、使用与构建说明见 [Poppy 桌面版指南](docs/poppy-desktop.md)。Python 包、核心 Runtime、CLI、环境变量和本地运行目录均统一使用 Poppy 名称。
+桌面版的安装、使用与构建说明见 [Poppy 桌面版指南](docs/poppy-desktop.md)；面向 M4 16GB 设备的下一阶段知识库设计见 [Poppy 个人知识库实施方案](docs/architecture/poppy-personal-knowledge-base-m4.md)。Python 包、核心 Runtime、CLI、环境变量和本地运行目录均统一使用 Poppy 名称。
 
 ## Poppy CLI
 
