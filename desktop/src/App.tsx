@@ -1,4 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -31,7 +32,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar } from "./components/Sidebar";
 import { GatewayClient, resolveGatewayInfo } from "./lib/gateway";
 import type { GatewayInfo } from "./lib/gateway";
-import type { ApprovalRule, AuditEvent, FeishuSettings, Grant, HistoryItem, LibraryDocument, LibrarySource, MemoryItem, RunEvent, SessionSummary, Settings, ToolCall } from "./types";
+import type { ApprovalRule, AuditEvent, Citation, FeishuSettings, Grant, HistoryItem, IndexJob, KnowledgeSpace, LibraryDocument, LibrarySource, MemoryItem, RunEvent, SessionSummary, Settings, ToolCall } from "./types";
 
 const PdfReader = lazy(() => import("./reader/PdfReader").then((module) => ({ default: module.PdfReader })));
 
@@ -129,6 +130,8 @@ function App() {
   const [approvalRules, setApprovalRules] = useState<ApprovalRule[]>([]);
   const [librarySources, setLibrarySources] = useState<LibrarySource[]>([]);
   const [libraryDocuments, setLibraryDocuments] = useState<LibraryDocument[]>([]);
+  const [knowledgeSpaces, setKnowledgeSpaces] = useState<KnowledgeSpace[]>([]);
+  const [indexJobs, setIndexJobs] = useState<IndexJob[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [input, setInput] = useState("");
@@ -147,6 +150,7 @@ function App() {
   const [renameValue, setRenameValue] = useState("");
   const [lastRequest, setLastRequest] = useState<RetryRequest>();
   const [readerPath, setReaderPath] = useState("");
+  const [readerCitation, setReaderCitation] = useState<Citation>();
   const disconnectRef = useRef<(() => void) | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerMenuRef = useRef<HTMLDivElement>(null);
@@ -155,6 +159,9 @@ function App() {
 
   const selected = useMemo(() => sessions.find((session) => session.id === selectedId), [sessions, selectedId]);
   const activeProjectName = activeWorkspace?.split(/[\\/]/).filter(Boolean).pop() || "项目";
+  const selectedScopeValue = selected?.knowledge_scope
+    ? `${selected.knowledge_scope.kind}:${selected.knowledge_scope.id || ""}`
+    : "auto:";
 
   useEffect(() => {
     void initialize();
@@ -212,6 +219,9 @@ function App() {
       }).catch(() => undefined);
       void client.librarySources().then((next) => {
         if (!stopped) setLibrarySources(next);
+      }).catch(() => undefined);
+      void client.indexJobs().then((next) => {
+        if (!stopped) setIndexJobs(next);
       }).catch(() => undefined);
     };
     refresh();
@@ -281,12 +291,12 @@ function App() {
   async function connectGateway(info: GatewayInfo) {
       const gateway = new GatewayClient(info);
       await gateway.waitUntilHealthy(info.token ? 30_000 : 750);
-      let snapshot: [SessionSummary[], Grant[], Settings, FeishuSettings, MemoryItem[], ApprovalRule[], LibrarySource[], AuditEvent[]] | undefined;
+      let snapshot: [SessionSummary[], Grant[], Settings, FeishuSettings, MemoryItem[], ApprovalRule[], LibrarySource[], AuditEvent[], KnowledgeSpace[], IndexJob[]] | undefined;
       let lastError: unknown;
       for (let attempt = 0; attempt < 8; attempt += 1) {
         try {
           snapshot = await Promise.all([
-            gateway.sessions(), gateway.grants(), gateway.settings(), gateway.feishuSettings(), gateway.memories(), gateway.approvalRules(), gateway.librarySources(), gateway.auditEvents(),
+            gateway.sessions(), gateway.grants(), gateway.settings(), gateway.feishuSettings(), gateway.memories(), gateway.approvalRules(), gateway.librarySources(), gateway.auditEvents(), gateway.knowledgeSpaces(), gateway.indexJobs(),
           ]);
           break;
         } catch (reason) {
@@ -295,7 +305,7 @@ function App() {
         }
       }
       if (!snapshot) throw lastError instanceof Error ? lastError : new Error("Poppy 无法加载本地数据");
-      const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList] = snapshot;
+      const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList, spaces, jobs] = snapshot;
       disconnectRef.current?.();
       setClient(gateway);
       setConnected(true);
@@ -307,6 +317,8 @@ function App() {
       setApprovalRules(ruleList);
       setLibrarySources(sourceList);
       setAuditEvents(auditList);
+      setKnowledgeSpaces(spaces);
+      setIndexJobs(jobs);
       if (sessionList[0]) await selectSession(gateway, sessionList[0].id);
       else if (grantList[0]) setActiveWorkspace(grantList[0].path);
   }
@@ -346,8 +358,8 @@ function App() {
 
   async function refreshMeta() {
     if (!client) return;
-    const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList] = await Promise.all([
-      client.sessions(), client.grants(), client.settings(), client.feishuSettings(), client.memories(), client.approvalRules(), client.librarySources(), client.auditEvents(),
+    const [sessionList, grantList, appSettings, feishu, memoryList, ruleList, sourceList, auditList, spaces, jobs] = await Promise.all([
+      client.sessions(), client.grants(), client.settings(), client.feishuSettings(), client.memories(), client.approvalRules(), client.librarySources(), client.auditEvents(), client.knowledgeSpaces(), client.indexJobs(),
     ]);
     setSessions(sessionList);
     setGrants(grantList);
@@ -357,6 +369,8 @@ function App() {
     setApprovalRules(ruleList);
     setLibrarySources(sourceList);
     setAuditEvents(auditList);
+    setKnowledgeSpaces(spaces);
+    setIndexJobs(jobs);
   }
 
   async function selectSession(gateway: GatewayClient, id: string) {
@@ -366,6 +380,7 @@ function App() {
       gateway.libraryDocuments(id),
     ]);
     setSelectedId(id);
+    setSessions((current) => current.map((session) => session.id === id ? detail : session));
     setTaskDraft(false);
     setActiveWorkspace(detail.session_type === "chat" ? undefined : detail.workspace_root);
     setMessages(visibleHistory(detail.history));
@@ -382,12 +397,45 @@ function App() {
     setActiveRun(undefined);
   }
 
-  async function changeDocumentLock(documentId: string) {
+  async function changeKnowledgeScope(value: string) {
     if (!client || !selectedId || activeRun) return;
     try {
-      const updated = await client.setDocumentLock(selectedId, documentId);
+      const separator = value.indexOf(":");
+      const kind = separator >= 0 ? value.slice(0, separator) : value;
+      const scopeId = separator >= 0 ? value.slice(separator + 1) : "";
+      const updated = await client.setKnowledgeScope(selectedId, kind, scopeId);
       setSessions((current) => current.map((session) => session.id === selectedId ? updated : session));
       setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function createNotebookFromVisibleDocuments() {
+    if (!client) return;
+    const name = window.prompt("给这个 Notebook 起一个名字");
+    if (!name?.trim()) return;
+    try {
+      const created = await client.createKnowledgeSpace(name.trim());
+      const configured = await client.updateKnowledgeSpace(created.id, {
+        document_ids: libraryDocuments.map((document) => document.id),
+      });
+      setKnowledgeSpaces((current) => [...current, configured].sort((a, b) => a.name.localeCompare(b.name)));
+      if (selectedId) await changeKnowledgeScope(`notebook:${created.id}`);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function openCitation(citation: Citation) {
+    if (citation.path.toLowerCase().endsWith(".pdf")) {
+      setReaderCitation(citation);
+      setReaderPath(citation.path);
+      return;
+    }
+    try {
+      await openPath(citation.path);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -583,6 +631,14 @@ function App() {
         const next = [...current];
         const last = next[next.length - 1];
         if (last?.role === "assistant") last.content = sanitizeAssistantContent(String(payload.content || ""));
+        return next;
+      });
+    } else if (event.event_type === "retrieval.citations") {
+      const citations = Array.isArray(payload.citations) ? payload.citations as Citation[] : [];
+      setMessages((current) => {
+        const next = [...current];
+        const last = next[next.length - 1];
+        if (last?.role === "assistant") last.citations = citations;
         return next;
       });
     } else if (event.event_type === "tool.requested") {
@@ -834,7 +890,18 @@ function App() {
                   <div className="message-body">
                     <div className="message-role">{message.role === "user" ? "你" : "Poppy"}</div>
                     {message.role === "assistant" ? (
-                      message.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <div className="typing"><i /><i /><i /></div>
+                      message.content ? <>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                        {!!message.citations?.length && <div className="answer-citations">
+                          {message.citations.map((citation) => (
+                            <button key={`${citation.chunk_id}-${citation.label}`} onClick={() => void openCitation(citation)} title={citation.quote}>
+                              <BookOpenText size={13} />
+                              <span>{citation.label} {citation.title}</span>
+                              <small>{citation.location.page ? `第 ${citation.location.page} 页` : citation.location.sheet ? `${citation.location.sheet}` : `行 ${citation.location.line_start || "?"}-${citation.location.line_end || "?"}`}</small>
+                            </button>
+                          ))}
+                        </div>}
+                      </> : <div className="typing"><i /><i /><i /></div>
                     ) : <><p>{message.content}</p>{!!message.attachments?.length && <div className="message-attachments">{message.attachments.map((path) => (
                       path.toLowerCase().endsWith(".pdf")
                         ? <button key={path} onClick={() => setReaderPath(path)} title="在内置阅读器中打开"><BookOpenText size={12} />{path.split("/").pop()}</button>
@@ -850,21 +917,26 @@ function App() {
         {connected && (selectedId || taskDraft) && (
           <div className="composer-wrap">
             {error && <div className="inline-error"><span>{error}</span>{lastRequest && !activeRun && <button onClick={() => void retryLastRequest()}>重试</button>}</div>}
-            {selectedId && <div className={`document-lock-bar ${selected?.locked_document ? "locked" : ""}`}>
+            {selectedId && <div className={`document-lock-bar ${selected?.knowledge_scope?.kind === "document" ? "locked" : ""}`}>
               <BookOpenText size={14} />
-              <span>{selected?.locked_document ? "当前锁定文档" : "文档范围"}</span>
+              <span>知识范围</span>
               <select
-                value={selected?.locked_document?.id || ""}
-                onChange={(event) => void changeDocumentLock(event.target.value)}
+                value={selectedScopeValue}
+                onChange={(event) => void changeKnowledgeScope(event.target.value)}
                 disabled={Boolean(activeRun)}
-                title="锁定后，普通问题只会从这一篇文档取证"
+                title="选择本轮回答允许检索的知识范围"
               >
-                <option value="">自动匹配（可能跨资料库）</option>
+                <option value="all:">全部知识库</option>
+                {selected?.session_type === "project" && <option value="project:">当前项目 · {activeProjectName}</option>}
+                {knowledgeSpaces.map((space) => (
+                  <option value={`notebook:${space.id}`} key={space.id}>Notebook · {space.name}</option>
+                ))}
                 {libraryDocuments.map((document) => (
-                  <option value={document.id} key={document.id}>{document.display_name}</option>
+                  <option value={`document:${document.id}`} key={document.id}>单文档 · {document.display_name}</option>
                 ))}
               </select>
-              <small>{selected?.locked_document ? "回答仅从此文档检索；可随时切换或解除" : "写出完整文件名时会自动锁定"}</small>
+              <button className="scope-add-button" onClick={() => void createNotebookFromVisibleDocuments()} disabled={Boolean(activeRun)} title="用当前列表里的文档创建 Notebook"><Plus size={13} /> Notebook</button>
+              <small>本轮：{selected?.knowledge_scope?.label || "自动"}；写出完整文件名会切到对应文档</small>
             </div>}
             {taskDraft && <div className="draft-context-bar">
               <button className="draft-context-button" onClick={() => grants.length ? setChoosingWorkspace(true) : void chooseFolder(false)}>
@@ -1019,7 +1091,8 @@ function App() {
           <PdfReader
             path={readerPath}
             client={client}
-            onClose={() => setReaderPath("")}
+            initialCitation={readerCitation?.path === readerPath ? readerCitation : undefined}
+            onClose={() => { setReaderPath(""); setReaderCitation(undefined); }}
             onSessionCreated={() => void refreshMeta()}
           />
         </Suspense>
@@ -1033,6 +1106,8 @@ function App() {
           memories={memories}
           approvalRules={approvalRules}
           librarySources={librarySources}
+          knowledgeSpaces={knowledgeSpaces}
+          indexJobs={indexJobs}
           auditEvents={auditEvents}
           onClose={() => setSettingsOpen(false)}
           onSaveSettings={async (values) => {
@@ -1080,6 +1155,8 @@ function App() {
           onAddLibrarySource={() => void chooseLibrarySource()}
           onDeleteLibrarySource={async (id) => { if (client) { await client.deleteLibrarySource(id); await refreshMeta(); } }}
           onReindexLibrary={async (id) => { if (client) { await client.reindexLibrary(id); await refreshMeta(); } }}
+          onCreateKnowledgeSpace={async () => { await createNotebookFromVisibleDocuments(); await refreshMeta(); }}
+          onDeleteKnowledgeSpace={async (id) => { if (client) { await client.deleteKnowledgeSpace(id); await refreshMeta(); } }}
         />
       )}
     </div>

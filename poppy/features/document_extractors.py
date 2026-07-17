@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+import re
 from pathlib import Path
 
 
@@ -23,6 +24,9 @@ MAX_EXTRACTED_CHARS = 2_000_000
 MAX_SHEET_ROWS = 10_000
 MAX_SHEET_COLUMNS = 200
 ROWS_PER_CHUNK = 80
+MAX_TEXT_CHUNK_CHARS = 2_800
+CHUNK_OVERLAP_CHARS = 320
+MIN_SECTION_SPLIT_CHARS = 900
 
 
 class DocumentExtractionError(ValueError):
@@ -326,25 +330,91 @@ def _read_xls(path):
 
 
 def _line_chunks(content, location, lines_per_chunk=ROWS_PER_CHUNK):
+    """Create section-aware chunks while preserving exact source line ranges.
+
+    ``lines_per_chunk`` remains in the signature for compatibility, but text
+    size and section boundaries now drive chunks. This keeps prose chunks in
+    the useful embedding range and prevents a short heading from being
+    detached from the paragraphs that follow it.
+    """
     lines = content.splitlines()
     chunks = []
-    for start in range(0, len(lines), lines_per_chunk):
-        body = "\n".join(lines[start : start + lines_per_chunk]).strip()
+    buffered = []
+    buffered_start = 0
+    section_title = ""
+    section_level = 0
+
+    def flush(end_index):
+        nonlocal buffered, buffered_start
+        body = "\n".join(buffered).strip()
         if not body:
-            continue
-        line_start = start + 1
-        line_end = min(len(lines), start + lines_per_chunk)
+            buffered = []
+            buffered_start = end_index
+            return
+        line_start = buffered_start + 1
+        line_end = max(line_start, end_index)
         chunk_location = dict(location)
         chunk_location.update({"line_start": line_start, "line_end": line_end})
+        if section_title:
+            chunk_location["section"] = section_title
         chunks.append(
             {
                 "line_start": line_start,
                 "line_end": line_end,
                 "content": body,
                 "location": chunk_location,
+                "section_title": section_title,
+                "section_level": section_level,
             }
         )
+        overlap = []
+        overlap_size = 0
+        for line in reversed(buffered):
+            if overlap and overlap_size + len(line) + 1 > CHUNK_OVERLAP_CHARS:
+                break
+            overlap.append(line)
+            overlap_size += len(line) + 1
+        buffered = list(reversed(overlap))
+        buffered_start = max(0, end_index - len(buffered))
+
+    for index, line in enumerate(lines):
+        heading = _heading(line)
+        current_size = sum(len(item) + 1 for item in buffered)
+        if heading and buffered and current_size >= MIN_SECTION_SPLIT_CHARS:
+            flush(index)
+        if heading:
+            section_title, section_level = heading
+        current_size = sum(len(item) + 1 for item in buffered)
+        projected = current_size + len(line) + 1
+        if buffered and projected > MAX_TEXT_CHUNK_CHARS:
+            flush(index)
+        if not buffered:
+            buffered_start = index
+        buffered.append(line)
+    if buffered:
+        flush(len(lines))
     return chunks
+
+
+def _heading(line):
+    stripped = str(line or "").strip()
+    markdown = re.match(r"^(#{1,6})\s+(.{1,160})$", stripped)
+    if markdown:
+        return markdown.group(2).strip(), len(markdown.group(1))
+    numbered = re.match(
+        r"^(?:chapter\s+\d+|(?:\d+\.)+\d*|[一二三四五六七八九十]+[、.])\s*(.{2,140})$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if numbered:
+        return stripped[:160], 2
+    symbol = re.match(
+        r"^(?:async\s+def|def|class|function|fn|struct|interface)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        stripped,
+    )
+    if symbol:
+        return symbol.group(1), 3
+    return None
 
 
 def _bounded(content):

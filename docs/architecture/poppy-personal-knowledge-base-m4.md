@@ -322,3 +322,16 @@ Embedding 记录必须保存 `model_id`、`dimension`、`content_hash` 和 `crea
 ---
 
 _Last updated: 2026-07-17 · Target device: Apple M4 / 16GB unified memory / 256GB storage_
+
+## 实施记录（2026-07-17）
+
+MVP 已落地到 Poppy 桌面端：SQLite/FTS5 保存元数据和关键词索引，LanceDB 保存 384 维向量；`multilingual-e5-small` 采用量化 ONNX、懒加载和索引后释放。聊天可选择全部知识库、当前项目、Notebook 或单文档，回答携带结构化引用，PDF 引用可跳页并高亮匹配文字。文件监听、持久化索引任务、失败原因、版本记录、可检索摘录和低磁盘保护也已接通。
+
+本机验收结果：
+
+- 真实模型中文查询成功召回英文段落，查询向量和文档向量均为 384 维。
+- 64 片段批量向量化约 0.744 秒，热查询向量约 1.7 毫秒，进程最大 RSS 约 700MB。
+- 100,000 个 384 维合成片段的 LanceDB 热检索 P50 约 26.35 毫秒、P95 约 31.74 毫秒，基准进程最大 RSS 约 869MB。
+- Python 全量测试 217 通过、1 跳过；桌面 TypeScript/Vite 构建、Rust `cargo check`、冻结 sidecar 跨语言检索和应用签名验证通过。
+
+真实资料集的 Recall@20、MRR 和引用正确率需要用户提供 50～100 个带正确来源标注的问题后持续测量。仓库内提供 `scripts/evaluate_knowledge_retrieval.py` 作为评测入口，`scripts/benchmark_knowledge_vectors.py` 用于复现 10 万片段性能基准。

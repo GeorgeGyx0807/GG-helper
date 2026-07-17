@@ -37,6 +37,12 @@ PYINSTALLER_CONFIG_DIR="$BUILD_ROOT/pyinstaller-config" "$PYTHON_BIN" -m PyInsta
   --collect-all xlrd \
   --collect-all lark_channel \
   --collect-all watchdog \
+  --collect-all fastembed \
+  --collect-all lancedb \
+  --collect-all pyarrow \
+  --collect-all onnxruntime \
+  --collect-all tokenizers \
+  --collect-all huggingface_hub \
   --add-binary "$OCR_HELPER:." \
   --add-binary "$SEMANTIC_HELPER:." \
   "$ROOT/scripts/poppy_gateway_sidecar.py"

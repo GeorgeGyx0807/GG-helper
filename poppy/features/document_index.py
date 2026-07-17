@@ -9,6 +9,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -16,6 +17,7 @@ from math import ceil
 
 from .document_extractors import DOCUMENT_EXTENSIONS, DocumentExtractionError, extract_document
 from .semantic_embeddings import SemanticEmbeddingService
+from .vector_store import LanceVectorStore
 from ..workspace import IGNORED_PATH_NAMES
 
 
@@ -36,12 +38,15 @@ SEMANTIC_CANDIDATE_LIMIT = 80
 FULL_DOCUMENT_MAX_CHARS = 160_000
 FULL_DOCUMENT_MAX_BATCHES = 4
 FULL_DOCUMENT_SECTION_COUNT = 16
+MIN_FREE_DISK_BYTES = int(os.environ.get("POPPY_MIN_FREE_DISK_GB", "30")) * 1024**3
 
 
 class DocumentIndex:
-    def __init__(self, database, semantic_service=None):
+    def __init__(self, database, semantic_service=None, vector_store=None):
         self.database = database
-        self.semantic = semantic_service or SemanticEmbeddingService()
+        data_root = Path(getattr(database, "path", Path.cwd())).parent
+        self.semantic = semantic_service or SemanticEmbeddingService(cache_dir=data_root / "models")
+        self.vector_store = vector_store or LanceVectorStore(data_root / "vectors")
 
     def list_sources(self):
         return [item for item in self.database.list_library_sources() if item.get("kind") == "folder"]
@@ -51,9 +56,12 @@ class DocumentIndex:
         return self.database.upsert_library_source(resolved, grant_id=grant["id"], kind="folder")
 
     def remove_source(self, source_id):
+        for document in self.database.list_documents(source_id):
+            self.vector_store.delete_document(document["id"])
         self.database.delete_library_source(source_id)
 
     def reindex(self, source_id="", progress_callback=None):
+        self._ensure_resource_budget()
         sources = [self.database.get_library_source(source_id)] if source_id else self.database.list_library_sources(enabled_only=True)
         results = []
         for source in sources:
@@ -142,6 +150,9 @@ class DocumentIndex:
                 last_error=errors[0]["error"] if errors else "",
             )
             results.append({"source_id": source["id"], "path": str(root), "documents": len(paths), "errors": errors})
+        if hasattr(self.semantic, "release"):
+            self.semantic.release()
+        self.vector_store.prune_documents(row["id"] for row in self.database.list_documents())
         return results
 
     def ingest_attachment(self, path, grant=None):
@@ -176,11 +187,32 @@ class DocumentIndex:
         document = self.database.get_document_by_path(resolved)
         return {"path": str(resolved), "kind": "file", "source_id": source["id"], "document_id": document["id"]}
 
-    def search(self, query, grants, limit=20, attachment_paths=()):
+    def search(self, query, grants, limit=20, attachment_paths=(), scope=None, preserve_duplicate_documents=False):
         source_ids = self._authorized_source_ids(grants, attachment_paths)
         if not source_ids:
             return []
-        rows = self._hybrid_search(query, source_ids=source_ids, limit=limit)
+        document_ids = None
+        scope = dict(scope or {})
+        kind = str(scope.get("kind") or "auto")
+        if kind == "notebook" and scope.get("id"):
+            notebook = self.database.get_knowledge_space_scope(scope["id"])
+            authorized_ids = {
+                item["id"] for item in self.database.list_document_summaries(source_ids)
+            }
+            document_ids = [
+                item for item in notebook.get("document_ids", []) if item in authorized_ids
+            ]
+            if not document_ids:
+                return []
+        elif kind == "document" and scope.get("id"):
+            document_ids = [str(scope["id"])]
+        rows = self._hybrid_search(
+            query,
+            source_ids=None if document_ids else source_ids,
+            document_ids=document_ids,
+            limit=limit,
+            preserve_duplicate_documents=preserve_duplicate_documents,
+        )
         return [
             row for row in rows
             if self._document_authorized(row["path"], grants, attachment_paths)
@@ -230,6 +262,7 @@ class DocumentIndex:
         return {**best[2], "match_confidence": best[0], "match_kind": "filename"}
 
     def index_path(self, source_id, path):
+        self._ensure_resource_budget()
         source = self.database.get_library_source(source_id)
         if source is None:
             return {"status": "missing_source", "path": str(path)}
@@ -259,6 +292,9 @@ class DocumentIndex:
             return {"status": "failed", "path": str(candidate), "error": str(exc)}
 
     def remove_path(self, source_id, path):
+        document = self.database.get_document_by_path(path)
+        if document is not None:
+            self.vector_store.delete_document(document["id"])
         removed = self.database.delete_document_by_path(path, source_id=source_id)
         self.database.clear_index_failure(source_id, path)
         self.database.mark_library_source_indexed(source_id)
@@ -347,6 +383,7 @@ class DocumentIndex:
             grants,
             limit=max(5, min(int(limit), 60)),
             attachment_paths=attachment_paths,
+            preserve_duplicate_documents=True,
         )
 
         title_name = Path(str(window_title or "")).name
@@ -451,6 +488,8 @@ class DocumentIndex:
             for chunk in self.database.list_document_chunks(document["id"])[:2]:
                 rows.append({
                     "id": document["id"],
+                    "source_id": document["source_id"],
+                    "chunk_id": chunk["id"],
                     "path": document["path"],
                     "display_name": document["display_name"],
                     "line_start": chunk["line_start"],
@@ -481,6 +520,8 @@ class DocumentIndex:
         for chunk in self.database.list_document_chunks(document["id"])[: max(1, int(limit))]:
             rows.append({
                 "id": document["id"],
+                "source_id": document["source_id"],
+                "chunk_id": chunk["id"],
                 "path": document["path"],
                 "display_name": document["display_name"],
                 "line_start": chunk["line_start"],
@@ -511,7 +552,9 @@ class DocumentIndex:
             and existing.get("source_id") == str(source_id)
             and (
                 not self.semantic.available
-                or self.database.document_embeddings_ready(existing["id"])
+                or self.database.document_embeddings_ready(
+                    existing["id"], getattr(self.semantic, "model_id", "")
+                )
             )
         ):
             return False
@@ -519,6 +562,35 @@ class DocumentIndex:
         content = extracted.content[:MAX_CHARS]
         if not content.strip() or not extracted.chunks:
             raise DocumentExtractionError("文件没有可索引的文字")
+        title = path.name
+        for line in content.splitlines()[:80]:
+            match = re.match(r"^#{1,3}\s+(.{2,200})$", line.strip())
+            if match:
+                title = match.group(1).strip()
+                break
+        chunks = [dict(item) for item in extracted.chunks]
+        for chunk in chunks:
+            section = str(chunk.get("section_title") or "").strip()
+            prefix = [f"文档：{title}", f"文件：{path.name}"]
+            if section:
+                prefix.append(f"章节：{section}")
+            chunk["context_text"] = "\n".join(prefix) + "\n正文：" + str(chunk.get("content") or "")
+            chunk["content_hash"] = hashlib.sha256(
+                chunk["context_text"].encode("utf-8", errors="replace")
+            ).hexdigest()
+        embeddings = []
+        for start in range(0, len(chunks), 16):
+            embeddings.extend(
+                self.semantic.embed_many(
+                    [item["context_text"] for item in chunks[start:start + 16]]
+                )
+            )
+        for chunk, embedding in zip(chunks, embeddings):
+            chunk["embedding_language"] = embedding.get("language", "")
+            chunk["embedding_base64"] = embedding.get("embedding", "")
+            chunk["embedding_model"] = embedding.get("model", "")
+            chunk["embedding_dimension"] = int(embedding.get("dimension") or 0)
+            chunk["vector"] = embedding.get("vector")
         document = self.database.upsert_document(
             source_id,
             path,
@@ -528,18 +600,21 @@ class DocumentIndex:
             stat.st_mtime_ns,
             hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
             content,
+            metadata={"title": title, "extractor": extracted.extractor},
         )
-        chunks = [dict(item) for item in extracted.chunks]
-        embeddings = []
-        for start in range(0, len(chunks), 48):
-            embeddings.extend(self.semantic.embed_many([item["content"] for item in chunks[start:start + 48]]))
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk["embedding_language"] = embedding.get("language", "")
-            chunk["embedding_base64"] = embedding.get("embedding", "")
-        self.database.replace_document_chunks(document["id"], chunks)
+        inserted = self.database.replace_document_chunks(document["id"], chunks)
+        self.vector_store.delete_document(document["id"])
+        vector_rows = [item for item in inserted if item.get("vector")]
+        if vector_rows:
+            model_id = str(vector_rows[0].get("embedding_model") or "")
+            dimension = int(vector_rows[0].get("embedding_dimension") or 0)
+            if model_id and dimension:
+                self.vector_store.replace_document(
+                    document["id"], source_id, vector_rows, model_id, dimension
+                )
         return True
 
-    def _hybrid_search(self, query, source_ids=None, document_ids=None, limit=20):
+    def _hybrid_search(self, query, source_ids=None, document_ids=None, limit=20, preserve_duplicate_documents=False):
         limit = max(1, int(limit))
         lexical = self.database.search_documents(
             query,
@@ -548,6 +623,21 @@ class DocumentIndex:
             document_ids=document_ids,
         )
         semantic = self._semantic_candidates(query, source_ids=source_ids, document_ids=document_ids)
+        if not document_ids:
+            document_scores = {}
+            for rank, row in enumerate(lexical, start=1):
+                key = str(row["id"])
+                document_scores[key] = document_scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            for rank, row in enumerate(semantic, start=1):
+                key = str(row["id"])
+                document_scores[key] = document_scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            candidate_documents = {
+                item[0]
+                for item in sorted(document_scores.items(), key=lambda item: (-item[1], item[0]))[:20]
+            }
+            if candidate_documents:
+                lexical = [row for row in lexical if str(row["id"]) in candidate_documents]
+                semantic = [row for row in semantic if str(row["id"]) in candidate_documents]
         fused = {}
         for rank, row in enumerate(lexical, start=1):
             item = fused.setdefault(int(row["chunk_id"]), dict(row))
@@ -576,7 +666,27 @@ class DocumentIndex:
                 int(item.get("line_start") or 0),
             )
         )
-        return rows[:limit]
+        selected = []
+        per_document = {}
+        seen_content = set()
+        for row in rows:
+            normalized = re.sub(r"\s+", " ", str(row.get("content") or "")).strip().casefold()
+            fingerprint_text = (
+                f"{row.get('id', '')}\n{normalized}"
+                if preserve_duplicate_documents else normalized
+            )
+            fingerprint = hashlib.sha256(fingerprint_text.encode("utf-8", errors="replace")).hexdigest()
+            if fingerprint in seen_content:
+                continue
+            document_id = str(row.get("id") or "")
+            if not document_ids and per_document.get(document_id, 0) >= max(2, min(4, limit // 2)):
+                continue
+            seen_content.add(fingerprint)
+            per_document[document_id] = per_document.get(document_id, 0) + 1
+            selected.append(row)
+            if len(selected) >= limit:
+                break
+        return selected
 
     def _semantic_candidates(self, query, source_ids=None, document_ids=None):
         query_embedding = self.semantic.embed_query(str(query or ""))
@@ -584,9 +694,37 @@ class DocumentIndex:
         vector = str(query_embedding.get("embedding") or "")
         if not language or not vector:
             return []
+        model_id = str(query_embedding.get("model") or "")
+        dimension = int(query_embedding.get("dimension") or 0)
+        raw_vector = query_embedding.get("vector")
+        if raw_vector is None and hasattr(self.semantic, "decode"):
+            raw_vector = self.semantic.decode(vector)
+        if model_id and dimension and raw_vector:
+            matches = self.vector_store.search(
+                raw_vector,
+                model_id,
+                dimension,
+                limit=SEMANTIC_CANDIDATE_LIMIT,
+                source_ids=source_ids,
+                document_ids=document_ids,
+            )
+            if matches:
+                scores = {
+                    int(item["chunk_id"]): float(item["semantic_score"])
+                    for item in matches
+                }
+                matched_rows = self.database.get_chunks_by_ids(
+                    [item["chunk_id"] for item in matches]
+                )
+                for row in matched_rows:
+                    row["semantic_score"] = scores.get(int(row["chunk_id"]), 0.0)
+                    row["rank"] = 0
+                    row["match_score"] = 0
+                return matched_rows
         rows = []
         for row in self.database.list_chunk_embeddings(source_ids=source_ids, document_ids=document_ids):
-            if str(row.get("embedding_language") or "") != language:
+            row_language = str(row.get("embedding_language") or "")
+            if language != "multilingual" and row_language not in {language, "multilingual"}:
                 continue
             score = self.semantic.similarity(vector, row.get("embedding_base64"))
             if score < 0.18:
@@ -616,6 +754,25 @@ class DocumentIndex:
             ):
                 source_ids.append(source["id"])
         return source_ids
+
+    def resource_status(self):
+        usage = shutil.disk_usage(Path(getattr(self.database, "path", Path.cwd())).parent)
+        return {
+            "free_disk_bytes": int(usage.free),
+            "minimum_free_disk_bytes": int(MIN_FREE_DISK_BYTES),
+            "indexing_allowed": int(usage.free) >= int(MIN_FREE_DISK_BYTES),
+            "embedding": self.semantic.status() if hasattr(self.semantic, "status") else {},
+            "vector_backend": "lancedb" if self.vector_store.available else "sqlite-fallback",
+            "vector_error": str(self.vector_store.last_error or ""),
+        }
+
+    def _ensure_resource_budget(self):
+        status = self.resource_status()
+        if not status["indexing_allowed"]:
+            free_gb = status["free_disk_bytes"] / 1024**3
+            raise RuntimeError(
+                f"可用磁盘仅 {free_gb:.1f}GB，低于 30GB 安全阈值；已暂停索引以保护本机。"
+            )
 
     def _document_authorized(self, path, grants, attachment_paths=()):
         path = Path(path).expanduser().resolve()

@@ -26,7 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { GatewayClient } from "../lib/gateway";
-import type { RunEvent } from "../types";
+import type { Citation, RunEvent } from "../types";
 import "./PdfReader.css";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
@@ -36,6 +36,7 @@ type ReaderMessage = {
   role: "user" | "assistant";
   content: string;
   page?: number;
+  citations?: Citation[];
 };
 
 type ReaderSelection = {
@@ -58,6 +59,7 @@ type Props = {
   client: GatewayClient;
   onClose: () => void;
   onSessionCreated?: () => void;
+  initialCitation?: Citation;
 };
 
 function cleanAnswer(value: string) {
@@ -141,7 +143,7 @@ function renderSelectableTextLayer(
   }
 }
 
-export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
+export function PdfReader({ path, client, onClose, onSessionCreated, initialCitation }: Props) {
   const fileName = useMemo(() => path.split(/[\\/]/).filter(Boolean).pop() || "文献.pdf", [path]);
   const [document, setDocument] = useState<PDFDocumentProxy>();
   const [pageNumber, setPageNumber] = useState(1);
@@ -195,7 +197,7 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
         }
         setDocument(loaded);
         setPageCount(loaded.numPages);
-        setPageNumber(1);
+        setPageNumber(Math.min(loaded.numPages, Math.max(1, Number(initialCitation?.location.page) || 1)));
       } catch (reason) {
         if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
       } finally {
@@ -207,7 +209,7 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
       disconnectRef.current?.();
       void loaded?.destroy();
     };
-  }, [path]);
+  }, [path, initialCitation?.location.page]);
 
   useEffect(() => {
     if (!document || !canvasRef.current || !textLayerRef.current || !pageStageRef.current) return;
@@ -263,6 +265,13 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
         if (cancelled) return;
         renderPhase = "创建可选择文字层";
         renderSelectableTextLayer(layer, viewport, textContent);
+        const quote = String(initialCitation?.quote || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+        if (quote && Number(initialCitation?.location.page || 0) === pageNumber) {
+          layer.querySelectorAll("span").forEach((span) => {
+            const value = (span.textContent || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+            if (value.length >= 4 && quote.includes(value)) span.classList.add("citation-highlight");
+          });
+        }
       } catch (reason) {
         if (!cancelled && String(reason).toLowerCase().includes("cancel") === false) {
           const detail = reason instanceof Error ? reason.message : String(reason);
@@ -276,7 +285,7 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
       cancelled = true;
       renderTask?.cancel();
     };
-  }, [document, pageNumber, scale]);
+  }, [document, pageNumber, scale, initialCitation]);
 
   const ensureSession = useCallback(async () => {
     if (sessionId) return sessionId;
@@ -334,6 +343,7 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
       ...excerpts,
     ];
     persistExcerpts(next);
+    void client.addKnowledgeNote("PDF 阅读摘录", { path, quote: selection.text });
     setQuestionSelection({ text: selection.text, page: selection.page });
     setFloatingSelection(undefined);
     window.getSelection()?.removeAllRanges();
@@ -390,6 +400,11 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
               message.id === assistantId
                 ? { ...message, content: cleanAnswer(String(payload.content || "")) }
                 : message
+            )));
+          } else if (event.event_type === "retrieval.citations") {
+            const citations = Array.isArray(payload.citations) ? payload.citations as Citation[] : [];
+            setMessages((current) => current.map((message) => (
+              message.id === assistantId ? { ...message, citations } : message
             )));
           } else if (event.event_type === "run.failed") {
             setError(String(payload.error || "Poppy 阅读当前文档失败。"));
@@ -462,6 +477,9 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
                 <canvas ref={canvasRef} />
                 <div className="textLayer" ref={textLayerRef} />
                 {rendering && <div className="pdf-page-rendering"><LoaderCircle className="spin" size={20} /></div>}
+                {initialCitation?.quote && Number(initialCitation.location.page || 0) === pageNumber && (
+                  <div className="pdf-citation-banner"><strong>{initialCitation.label}</strong>{initialCitation.quote}</div>
+                )}
               </div>
             </div>
           )}
@@ -508,6 +526,15 @@ export function PdfReader({ path, client, onClose, onSessionCreated }: Props) {
                   {!!pages.length && (
                     <div className="pdf-page-citations">
                       {pages.map((page) => <button key={page} onClick={() => setPageNumber(page)}>跳到第 {page} 页</button>)}
+                    </div>
+                  )}
+                  {!!message.citations?.length && (
+                    <div className="pdf-page-citations">
+                      {message.citations.map((citation) => (
+                        <button key={`${citation.chunk_id}-${citation.label}`} onClick={() => citation.location.page && setPageNumber(citation.location.page)} title={citation.quote}>
+                          {citation.label} {citation.location.page ? `第 ${citation.location.page} 页` : citation.title}
+                        </button>
+                      ))}
                     </div>
                   )}
                 </article>

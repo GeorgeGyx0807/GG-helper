@@ -9,6 +9,8 @@ description = "Poppy local-first desktop assistant and coding agent"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.116,<1",
+  "fastembed>=0.7,<1",
+  "lancedb>=0.25,<1",
   "lark-channel-sdk==1.1.0",
   "markitdown[docx,pdf,pptx,xls,xlsx]>=0.1.6",
   "uvicorn[standard]>=0.35,<1",

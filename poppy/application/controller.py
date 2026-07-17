@@ -100,7 +100,29 @@ class DesktopController:
                 document["path"], grants, attachments
             ):
                 raise PermissionError("该文档不在当前会话的授权范围内")
+        if document_id:
+            self.database.set_session_knowledge_scope(session_id, "document", document_id)
+        else:
+            self.database.set_session_knowledge_scope(session_id, "auto", "")
         return self._enrich_session(self.database.set_session_document_lock(session_id, document_id))
+
+    def set_session_knowledge_scope(self, session_id, kind="auto", scope_id=""):
+        item = self.database.get_session(session_id)
+        if item is None:
+            raise KeyError(f"unknown session: {session_id}")
+        if kind == "document" and scope_id:
+            grants = self.database.list_grants() if item.get("session_type") == "chat" else self._session_grants(item)
+            document = self.database.get_document(scope_id)
+            if document is None or not self.document_index._document_authorized(
+                document["path"], grants, self._attachments_for_session(session_id)
+            ):
+                raise PermissionError("该文档不在当前会话的授权范围内")
+            self.database.set_session_document_lock(session_id, scope_id)
+        else:
+            self.database.set_session_document_lock(session_id, "")
+        return self._enrich_session(
+            self.database.set_session_knowledge_scope(session_id, kind, scope_id)
+        )
 
     def rename_session(self, session_id, title):
         title = str(title).strip()
@@ -154,11 +176,17 @@ class DesktopController:
                 )
 
         session_type = self._normalize_session_type(item.get("session_type", "project"))
-        scoped_grants = (
-            [self._require_grant(item["workspace_root"])]
-            if session_type == "project"
-            else ([] if channel_read_only else self.database.list_grants())
-        )
+        knowledge_scope = self._resolved_knowledge_scope(item)
+        if channel_read_only:
+            scoped_grants = []
+        elif knowledge_scope["kind"] in {"all", "notebook"}:
+            scoped_grants = self.database.list_grants()
+        else:
+            scoped_grants = (
+                [self._require_grant(item["workspace_root"])]
+                if session_type == "project"
+                else self.database.list_grants()
+            )
         self._ensure_empty_sources_indexed(scoped_grants)
         session_attachments = self._attachments_for_session(session_id)
         scoped_document = None
@@ -175,6 +203,7 @@ class DesktopController:
                 scoped_document = self.database.get_document_by_path(requested_path)
             if scoped_document is not None:
                 self.database.set_session_document_lock(session_id, scoped_document["id"])
+                self.database.set_session_knowledge_scope(session_id, "document", scoped_document["id"])
         if scoped_document is None:
             matched = self.document_index.match_document_name(
                 message, scoped_grants, attachment_paths=session_attachments
@@ -182,6 +211,7 @@ class DesktopController:
             if matched is not None:
                 scoped_document = self.database.get_document(matched["id"])
                 self.database.set_session_document_lock(session_id, matched["id"])
+                self.database.set_session_knowledge_scope(session_id, "document", matched["id"])
         if scoped_document is None and item.get("locked_document_id"):
             locked = self.database.get_document(item["locked_document_id"])
             if locked and self.document_index._document_authorized(
@@ -190,6 +220,7 @@ class DesktopController:
                 scoped_document = locked
             else:
                 self.database.set_session_document_lock(session_id, "")
+                self.database.set_session_knowledge_scope(session_id, "auto", "")
         quick_context = self._quick_context(quick_context_id) if quick_context_id else None
         if quick_context and session_attachments:
             refreshed_match = self.document_index.locate_selection(
@@ -207,6 +238,7 @@ class DesktopController:
                 if matched_document is not None:
                     scoped_document = matched_document
                     self.database.set_session_document_lock(session_id, matched_document["id"])
+                    self.database.set_session_knowledge_scope(session_id, "document", matched_document["id"])
             nearby_hits = list(match.get("context_rows") or [])
             if str(quick_intent or "").strip().lower() == "ask" and match.get("document_id"):
                 question_hits = self.document_index.search_document(
@@ -233,7 +265,14 @@ class DesktopController:
                 scoped_grants,
                 limit=6,
                 attachment_paths=session_attachments,
+                scope=knowledge_scope,
             )
+        knowledge_notes = self.database.search_knowledge_notes(
+            message,
+            space_id=knowledge_scope.get("id", "") if knowledge_scope.get("kind") == "notebook" else "",
+            document_id=scoped_document["id"] if scoped_document is not None else "",
+            limit=6,
+        )
         if not document_hits and attachment_paths:
             document_hits = self.document_index.preview(
                 [], attachment_paths=attachment_paths, limit=6
@@ -248,6 +287,12 @@ class DesktopController:
             )
         if document_hits:
             agent_message += DOCUMENT_CONTEXT_MARKER + self._render_document_context(document_hits)
+        if knowledge_notes:
+            agent_message += "\n\n[Poppy 个人笔记]\n" + "\n\n".join(
+                f"[N{index}] {note.get('content', '')}\n摘录：{note.get('quote', '')}"
+                for index, note in enumerate(knowledge_notes, start=1)
+            )
+        retrieval_citations = self._citations_from_hits(document_hits)
         agent = self._get_agent(
             session_id,
             item,
@@ -261,7 +306,12 @@ class DesktopController:
                     message,
                     "我还不知道要通读哪一篇文档。请先在输入框上方锁定文档，或在问题中写出完整文件名。",
                 )
-            return self.service.start_run(
+            full_citations = self._citations_from_hits(
+                self.document_index.preview_document(
+                    scoped_document["id"], scoped_grants, session_attachments, limit=12
+                )
+            )
+            started = self.service.start_run(
                 agent,
                 self._full_document_preparer(
                     message,
@@ -270,7 +320,11 @@ class DesktopController:
                     session_attachments,
                     attachment_paths,
                 ),
+                citations=full_citations,
             )
+            if full_citations:
+                self.database.replace_run_citations(started["run_id"], session_id, full_citations)
+            return started
         if scoped_document is not None and not quick_context and not self.document_index.evidence_sufficient(document_hits):
             return self.service.start_static_run(
                 agent,
@@ -278,7 +332,25 @@ class DesktopController:
                 f"我在当前锁定文档《{scoped_document['display_name']}》中没有找到足够证据回答这个问题。"
                 "为避免猜测，我先不补全答案。你可以换一种关键词、切换文档，或使用“全文模式”进行跨章节综合。",
             )
-        return self.service.start_run(agent, agent_message)
+        if (
+            scoped_document is None
+            and not quick_context
+            and self._requires_library_evidence(message, knowledge_scope)
+            and not self.document_index.evidence_sufficient(document_hits)
+            and not knowledge_notes
+        ):
+            return self.service.start_static_run(
+                agent,
+                message,
+                f"我在“{knowledge_scope.get('label') or '当前知识范围'}”中没有找到足够证据回答这个问题。"
+                "为避免把模型常识冒充成你的资料内容，我先不猜测。你可以换关键词、扩大知识范围或加入相关文件。",
+            )
+        started = self.service.start_run(agent, agent_message, citations=retrieval_citations)
+        if retrieval_citations:
+            self.database.replace_run_citations(
+                started["run_id"], session_id, retrieval_citations
+            )
+        return started
 
     def start_channel_run(self, session_id, message):
         """Start a remote channel run with a strictly read-only tool surface."""
@@ -370,6 +442,9 @@ class DesktopController:
             "timeout": 300,
         }
         settings.update(self.database.get_settings())
+        saved_embedding_mode = str(settings.get("embedding_mode") or self.document_index.semantic.mode)
+        if saved_embedding_mode != self.document_index.semantic.mode:
+            self.document_index.semantic.set_mode(saved_embedding_mode)
         probe = DesktopAgentConfig(
             workspace_root=str(self.paths.root),
             base_url=settings["base_url"],
@@ -379,13 +454,17 @@ class DesktopController:
             settings["api_key_configured"] = bool(self.agent_factory.api_key_for(probe))
         else:
             settings["api_key_configured"] = bool(self.agent_factory.api_key_provider())
+        settings["embedding_mode"] = self.document_index.semantic.mode
+        settings["knowledge_base_status"] = self.document_index.resource_status()
         return settings
 
     def update_settings(self, values):
-        allowed = {"model", "base_url", "timeout", "max_steps", "max_new_tokens"}
+        allowed = {"model", "base_url", "timeout", "max_steps", "max_new_tokens", "embedding_mode"}
         for key, value in values.items():
             if key in allowed:
                 self.database.set_setting(key, value)
+        if "embedding_mode" in values:
+            self.document_index.semantic.set_mode(values["embedding_mode"])
         return self.settings()
 
     def feishu_settings(self):
@@ -457,6 +536,42 @@ class DesktopController:
             for item in self.document_index.list_sources()
         ]
 
+    def list_knowledge_spaces(self):
+        return [
+            self.database.get_knowledge_space_scope(item["id"])
+            for item in self.database.list_knowledge_spaces()
+        ]
+
+    def create_knowledge_space(self, name, kind="notebook", description=""):
+        return self.database.create_knowledge_space(name, kind=kind, description=description)
+
+    def update_knowledge_space(self, space_id, source_ids=None, document_ids=None):
+        if source_ids is not None:
+            self.database.set_knowledge_space_sources(space_id, source_ids)
+        if document_ids is not None:
+            self.database.set_knowledge_space_documents(space_id, document_ids)
+        return self.database.get_knowledge_space_scope(space_id)
+
+    def delete_knowledge_space(self, space_id):
+        self.database.delete_knowledge_space(space_id)
+
+    def list_index_jobs(self, source_id="", limit=200):
+        return self.database.list_index_jobs(source_id, limit=limit)
+
+    def list_knowledge_notes(self, space_id="", document_id=""):
+        return self.database.list_knowledge_notes(space_id=space_id, document_id=document_id)
+
+    def add_knowledge_note(self, content, space_id="", document_id="", chunk_id=None, quote="", path=""):
+        if not document_id and path:
+            document = self.database.get_document_by_path(path)
+            document_id = document["id"] if document else ""
+        return self.database.add_knowledge_note(
+            content, space_id=space_id, document_id=document_id, chunk_id=chunk_id, quote=quote
+        )
+
+    def delete_knowledge_note(self, note_id):
+        self.database.delete_knowledge_note(note_id)
+
     def list_library_documents(self, session_id=""):
         if session_id:
             session = self.database.get_session(session_id)
@@ -501,11 +616,16 @@ class DesktopController:
             return scheduled
         return self.document_index.reindex(source_id)
 
-    def search_library(self, query, limit=20):
+    def search_library(self, query, limit=20, scope_kind="all", scope_id=""):
         # Indexing happens when a folder is authorized, explicitly rebuilt, or
         # an attachment is selected. Query-time extraction made large PDFs take
         # minutes and is deliberately avoided here.
-        return self.document_index.search(query, self.database.list_grants(), limit=limit)
+        return self.document_index.search(
+            query,
+            self.database.list_grants(),
+            limit=limit,
+            scope={"kind": scope_kind, "id": scope_id},
+        )
 
     def get_library_document(self, document_id):
         return self.document_index.read_document(document_id, self.database.list_grants())
@@ -699,6 +819,26 @@ class DesktopController:
             return [self._require_grant(session["workspace_root"])]
         return self.database.list_grants()
 
+    def _resolved_knowledge_scope(self, session):
+        kind = str(session.get("knowledge_scope_kind") or "auto")
+        scope_id = str(session.get("knowledge_scope_id") or "")
+        if kind == "auto":
+            kind = "project" if self._normalize_session_type(session.get("session_type", "project")) == "project" else "all"
+        if kind == "notebook":
+            space = self.database.get_knowledge_space(scope_id)
+            if space is None:
+                return {"kind": "all", "id": "", "label": "全部知识库"}
+            return {"kind": kind, "id": scope_id, "label": space["name"]}
+        if kind == "document":
+            document = self.database.get_document(scope_id)
+            if document is None:
+                return {"kind": "all", "id": "", "label": "全部知识库"}
+            return {"kind": kind, "id": scope_id, "label": document["display_name"]}
+        if kind == "project":
+            label = Path(str(session.get("workspace_root") or "项目")).name or "当前项目"
+            return {"kind": kind, "id": "", "label": label}
+        return {"kind": "all", "id": "", "label": "全部知识库"}
+
     def _enrich_session(self, item):
         enriched = dict(item)
         document_id = str(enriched.get("locked_document_id") or "")
@@ -711,6 +851,7 @@ class DesktopController:
             }
             if document else None
         )
+        enriched["knowledge_scope"] = self._resolved_knowledge_scope(enriched)
         return enriched
 
     def _full_document_preparer(
@@ -872,9 +1013,10 @@ class DesktopController:
     def _render_document_context(rows, max_chars=14_000):
         blocks = [
             "以下内容已由 Poppy 在本机解析并检索。请直接依据这些片段回答；只有证据不足时才继续搜索文档，禁止委派给其他 agent。"
+            "每个关键事实后必须标注对应的 [S1]、[S2] 等证据编号；不得引用本证据包以外的编号。"
         ]
         used = len(blocks[0])
-        for row in rows:
+        for citation_index, row in enumerate(rows, start=1):
             location = row.get("location") or {}
             kind = location.get("kind")
             if kind == "pdf_page":
@@ -883,12 +1025,54 @@ class DesktopController:
                 locator = f"工作表 {location.get('sheet', '?')} 第 {location.get('row_start', '?')}-{location.get('row_end', '?')} 行"
             else:
                 locator = f"转换文本行 {row.get('line_start', '?')}-{row.get('line_end', '?')}"
-            block = f"\n[{row.get('display_name') or Path(row['path']).name} · {locator}]\n{row.get('content', '')}"
+            block = (
+                f"\n[S{citation_index}] "
+                f"[{row.get('display_name') or Path(row['path']).name} · {locator}]\n"
+                f"{row.get('content', '')}"
+            )
             if used + len(block) > max_chars:
                 break
             blocks.append(block)
             used += len(block)
         return "\n".join(blocks)
+
+    @staticmethod
+    def _citations_from_hits(rows):
+        citations = []
+        for index, row in enumerate(rows, start=1):
+            chunk_id = int(row.get("chunk_id") or 0)
+            document_id = str(row.get("id") or row.get("document_id") or "")
+            quote = str(row.get("content") or "").strip()
+            if not chunk_id or not document_id or not quote:
+                continue
+            location = dict(row.get("location") or {})
+            citations.append(
+                {
+                    "citation_index": index,
+                    "label": f"S{index}",
+                    "source_id": str(row.get("source_id") or ""),
+                    "document_id": document_id,
+                    "chunk_id": chunk_id,
+                    "title": str(row.get("display_name") or Path(str(row.get("path") or "")).name),
+                    "display_name": str(row.get("display_name") or Path(str(row.get("path") or "")).name),
+                    "path": str(row.get("path") or ""),
+                    "quote": quote[:1200],
+                    "location": location,
+                }
+            )
+        return citations
+
+    @staticmethod
+    def _requires_library_evidence(message, scope):
+        kind = str((scope or {}).get("kind") or "all")
+        if kind == "notebook":
+            return True
+        text = str(message or "").casefold()
+        return bool(re.search(
+            r"(?:论文|文档|资料|知识库|项目|文件|报告|实验|作者|这篇|上述|原文|paper|document|report|project|file|study)|"
+            r"\.(?:pdf|docx?|xlsx?|pptx?|md|txt)\b",
+            text,
+        ))
 
     @staticmethod
     def _merge_document_hits(*groups, limit=8):

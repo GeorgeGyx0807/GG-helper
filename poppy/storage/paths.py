@@ -68,6 +68,14 @@ class AppPaths:
         return self.root / "extracted"
 
     @property
+    def vectors(self):
+        return self.root / "vectors"
+
+    @property
+    def models(self):
+        return self.root / "models"
+
+    @property
     def backups(self):
         return self.root / "backups"
 
@@ -84,6 +92,8 @@ class AppPaths:
             self.logs,
             self.documents,
             self.extracted,
+            self.vectors,
+            self.models,
             self.backups,
         ):
             path.mkdir(parents=True, exist_ok=True)

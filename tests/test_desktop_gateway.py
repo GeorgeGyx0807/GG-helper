@@ -122,6 +122,72 @@ def test_filename_mention_and_manual_document_lock_keep_retrieval_scoped(tmp_pat
     assert changed.json()["locked_document"]["display_name"] == "paper-b.md"
 
 
+def test_knowledge_scope_notebook_and_structured_citations_are_visible(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    selected = workspace / "selected.md"
+    excluded = workspace / "excluded.md"
+    selected.write_text("# Selected\ncheckpoint evidence belongs to selected", encoding="utf-8")
+    excluded.write_text("# Excluded\ncheckpoint evidence belongs to excluded", encoding="utf-8")
+    controller, client, headers = build_gateway(tmp_path, ["<final>结论 [S1]</final>"])
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    session = client.post(
+        "/sessions", headers=headers, json={"title": "Knowledge", "session_type": "chat"}
+    ).json()
+    documents = client.get("/library/documents", headers=headers).json()
+    selected_document = next(item for item in documents if item["display_name"] == selected.name)
+    space = client.post(
+        "/knowledge/spaces", headers=headers, json={"name": "My notebook"}
+    ).json()
+    configured = client.patch(
+        f"/knowledge/spaces/{space['id']}",
+        headers=headers,
+        json={"document_ids": [selected_document["id"]]},
+    )
+    assert configured.status_code == 200
+    scoped = client.patch(
+        f"/sessions/{session['id']}/knowledge-scope",
+        headers=headers,
+        json={"kind": "notebook", "scope_id": space["id"]},
+    ).json()
+    assert scoped["knowledge_scope"]["label"] == "My notebook"
+
+    started = client.post(
+        "/runs",
+        headers=headers,
+        json={"session_id": session["id"], "message": "checkpoint evidence 是什么？"},
+    ).json()
+    result = wait_for_terminal(client, headers, started["run_id"])
+    assert result["citations"]
+    citation = result["citations"][0]
+    assert citation["path"] == str(selected.resolve())
+    assert citation["quote"] in selected.read_text(encoding="utf-8")
+    events = client.get(f"/runs/{started['run_id']}/events", headers=headers).json()
+    assert events[-2]["event_type"] == "retrieval.citations"
+    assert events[-1]["event_type"] == "run.completed"
+    history = client.get(f"/sessions/{session['id']}", headers=headers).json()["history"]
+    assert history[-1]["citations"][0]["chunk_id"] == citation["chunk_id"]
+    assert controller.database.list_run_citations(started["run_id"])
+
+
+def test_pdf_excerpt_note_is_resolved_by_path_and_searchable(tmp_path):
+    workspace = tmp_path / "papers"
+    workspace.mkdir()
+    path = workspace / "paper.md"
+    path.write_text("indexed source", encoding="utf-8")
+    _controller, client, headers = build_gateway(tmp_path, ["<final>ok</final>"])
+    client.post("/grants", headers=headers, json={"path": str(workspace), "can_read": True})
+    created = client.post(
+        "/knowledge/notes",
+        headers=headers,
+        json={"content": "PDF 阅读摘录", "quote": "durable checkpoint insight", "path": str(path)},
+    )
+    assert created.status_code == 201
+    note = created.json()
+    assert note["document_id"]
+    assert _controller.database.search_knowledge_notes("checkpoint")[0]["id"] == note["id"]
+
+
 def test_locked_document_returns_deterministic_unknown_when_evidence_is_absent(tmp_path):
     workspace = tmp_path / "papers"
     workspace.mkdir()

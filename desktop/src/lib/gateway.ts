@@ -7,6 +7,9 @@ import type {
   LibraryDocument,
   LibrarySearchResult,
   LibrarySource,
+  KnowledgeNote,
+  KnowledgeSpace,
+  IndexJob,
   MemoryItem,
   QuickContextResult,
   QuickIntent,
@@ -123,6 +126,13 @@ export class GatewayClient {
     return this.request<SessionSummary>(`/sessions/${id}/document-lock`, {
       method: "PATCH",
       body: JSON.stringify({ document_id }),
+    });
+  }
+
+  setKnowledgeScope(id: string, kind: string, scope_id = "") {
+    return this.request<SessionSummary>(`/sessions/${id}/knowledge-scope`, {
+      method: "PATCH",
+      body: JSON.stringify({ kind, scope_id }),
     });
   }
 
@@ -309,10 +319,57 @@ export class GatewayClient {
     return this.request<{ source_id: string; path: string; documents: number }[]>(`/library/reindex${query}`, { method: "POST" });
   }
 
-  searchLibrary(query: string, limit = 20) {
+  searchLibrary(query: string, limit = 20, scope_kind = "all", scope_id = "") {
     return this.request<LibrarySearchResult[]>("/library/search", {
       method: "POST",
-      body: JSON.stringify({ query, limit }),
+      body: JSON.stringify({ query, limit, scope_kind, scope_id }),
     });
+  }
+
+  knowledgeSpaces() {
+    return this.request<KnowledgeSpace[]>("/knowledge/spaces");
+  }
+
+  createKnowledgeSpace(name: string, kind: "notebook" | "project" = "notebook", description = "") {
+    return this.request<KnowledgeSpace>("/knowledge/spaces", {
+      method: "POST",
+      body: JSON.stringify({ name, kind, description }),
+    });
+  }
+
+  updateKnowledgeSpace(id: string, values: { source_ids?: string[]; document_ids?: string[] }) {
+    return this.request<KnowledgeSpace>(`/knowledge/spaces/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    });
+  }
+
+  deleteKnowledgeSpace(id: string) {
+    return this.request<void>(`/knowledge/spaces/${id}`, { method: "DELETE" });
+  }
+
+  indexJobs(sourceId = "", limit = 200) {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (sourceId) params.set("source_id", sourceId);
+    return this.request<IndexJob[]>(`/library/index-jobs?${params}`);
+  }
+
+  knowledgeNotes(spaceId = "", documentId = "") {
+    const params = new URLSearchParams();
+    if (spaceId) params.set("space_id", spaceId);
+    if (documentId) params.set("document_id", documentId);
+    const query = params.size ? `?${params}` : "";
+    return this.request<KnowledgeNote[]>(`/knowledge/notes${query}`);
+  }
+
+  addKnowledgeNote(content: string, values: Partial<KnowledgeNote> & { path?: string } = {}) {
+    return this.request<KnowledgeNote>("/knowledge/notes", {
+      method: "POST",
+      body: JSON.stringify({ content, ...values }),
+    });
+  }
+
+  deleteKnowledgeNote(id: string) {
+    return this.request<void>(`/knowledge/notes/${id}`, { method: "DELETE" });
   }
 }

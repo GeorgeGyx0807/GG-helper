@@ -118,6 +118,11 @@ button { border: 0; cursor: pointer; }
 .message-body code { font-family: "SFMono-Regular", Consolas, monospace; font-size: .88em; color: #dbe9a6; background: #26281f; border: 1px solid #35382b; border-radius: 5px; padding: 2px 5px; }
 .message-body pre { overflow: auto; padding: 14px; background: #11120f; border: 1px solid var(--border); border-radius: 9px; }
 .message-body pre code { padding: 0; color: #d6d8cf; background: none; border: 0; }
+.answer-citations { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.answer-citations button { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
+.answer-citations button:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+.answer-citations span { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.answer-citations small { color: var(--muted); white-space: nowrap; font-size: 10px; }
 .typing { display: flex; gap: 4px; padding-top: 8px; }.typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); animation: bounce 1s infinite; }.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
 
 .tool-stack { margin: -10px 0 28px 42px; display: flex; flex-direction: column; gap: 8px; }
@@ -138,6 +143,8 @@ button { border: 0; cursor: pointer; }
 .document-lock-bar > span { font-size: 11px; white-space: nowrap; }
 .document-lock-bar select { min-width: 180px; max-width: 330px; flex: 1; border: 0; outline: 0; background: transparent; color: inherit; font: inherit; }
 .document-lock-bar small { font-size: 10px; color: var(--muted); }
+.scope-add-button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; font-size: 10px; cursor: pointer; white-space: nowrap; }
+.scope-add-button:hover { border-color: var(--accent); color: var(--accent); }
 .draft-context-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; padding: 7px 10px; border-radius: 9px; color: var(--muted); background: rgba(127,127,110,.1); font-size: 10px; }
 .draft-context-button { display: inline-flex; align-items: center; gap: 6px; padding: 3px 5px; border-radius: 6px; color: var(--soft); background: transparent; font-size: 11px; }
 .draft-context-button:hover { color: var(--accent); background: var(--panel-3); }

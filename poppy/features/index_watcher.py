@@ -66,6 +66,7 @@ class LibraryIndexWatcher:
         if self.running:
             return
         self.stop_event.clear()
+        self.document_index.database.recover_interrupted_index_jobs()
         if Observer is not None:
             self.observer = Observer(timeout=0.4)
             self.observer.start()
@@ -79,7 +80,7 @@ class LibraryIndexWatcher:
 
     def stop(self, timeout=3.0):
         self.stop_event.set()
-        self.queue.put(("", "stop", "", 0.0))
+        self.queue.put(("", "stop", "", 0.0, ""))
         if self.observer is not None:
             self.observer.stop()
             self.observer.join(timeout)
@@ -113,14 +114,23 @@ class LibraryIndexWatcher:
     def enqueue(self, source_id, operation, path, immediate=False):
         due = time.monotonic() if immediate else time.monotonic() + self.debounce_seconds
         key = (str(source_id), str(Path(path).expanduser()), str(operation))
+        job = self.document_index.database.create_index_job(
+            key[0], key[2], path=key[1]
+        )
         with self.lock:
-            self.pending[key] = due
-        self.queue.put((key[0], key[2], key[1], due))
+            previous = self.pending.get(key)
+            self.pending[key] = (due, job["id"])
+        if previous:
+            self.document_index.database.update_index_job(
+                previous[1], status="cancelled", stage="debounced", progress=0
+            )
+        self.queue.put((key[0], key[2], key[1], due, job["id"]))
+        return job
 
     def _run(self):
         while not self.stop_event.is_set():
             try:
-                source_id, operation, path, due = self.queue.get(timeout=0.25)
+                source_id, operation, path, due, job_id = self.queue.get(timeout=0.25)
             except Empty:
                 continue
             if operation == "stop":
@@ -131,17 +141,33 @@ class LibraryIndexWatcher:
             key = (source_id, path, operation)
             with self.lock:
                 latest = self.pending.get(key)
-                if latest is None or latest != due:
+                if latest is None or latest != (due, job_id):
                     continue
                 self.pending.pop(key, None)
             try:
+                self.document_index.database.update_index_job(
+                    job_id, status="running", stage="indexing", progress=10
+                )
                 if operation == "rescan":
-                    self.document_index.reindex(source_id)
+                    self.document_index.reindex(
+                        source_id,
+                        progress_callback=lambda _source, progress, _indexed, _failed: self.document_index.database.update_index_job(
+                            job_id, status="running", stage="embedding", progress=progress
+                        ),
+                    )
                 elif operation == "delete":
                     self.document_index.remove_path(source_id, path)
                 else:
-                    self.document_index.index_path(source_id, path)
+                    result = self.document_index.index_path(source_id, path)
+                    if result.get("status") == "failed":
+                        raise RuntimeError(result.get("error") or "文件索引失败")
+                self.document_index.database.update_index_job(
+                    job_id, status="completed", stage="completed", progress=100
+                )
             except Exception as exc:
+                self.document_index.database.update_index_job(
+                    job_id, status="failed", stage="failed", progress=100, error=str(exc)
+                )
                 self.document_index.database.update_library_source_index_state(
                     source_id, "error", 100, last_error=str(exc)
                 )

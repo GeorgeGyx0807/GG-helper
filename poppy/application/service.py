@@ -5,6 +5,7 @@ from threading import Event, Lock, Thread
 from typing import Callable, Dict, List, Optional
 
 from .cancellation import CancellationToken, RunCancelled
+from .events import RunEvent
 from ..workspace import now
 
 
@@ -31,6 +32,7 @@ class ActiveRun:
     status: str = "starting"
     answer: str = ""
     error: str = ""
+    citations: List[dict] = field(default_factory=list)
     events: List[dict] = field(default_factory=list)
     approvals: Dict[str, ApprovalWaiter] = field(default_factory=dict)
     early_approval_decisions: Dict[str, str] = field(default_factory=dict)
@@ -42,6 +44,7 @@ class ActiveRun:
             "status": self.status,
             "answer": self.answer,
             "error": self.error,
+            "citations": [dict(item) for item in self.citations],
         }
 
 
@@ -63,11 +66,16 @@ class AssistantService:
         self._active_sessions: Dict[str, str] = {}
         self._lock = Lock()
 
-    def start_run(self, agent, user_message):
+    def start_run(self, agent, user_message, citations=None):
         session_id = agent.session["id"]
         run_id = agent.new_run_id()
         token = CancellationToken()
-        run = ActiveRun(run_id=run_id, session_id=session_id, cancellation_token=token)
+        run = ActiveRun(
+            run_id=run_id,
+            session_id=session_id,
+            cancellation_token=token,
+            citations=[dict(item) for item in (citations or [])],
+        )
         with self._lock:
             existing_run_id = self._active_sessions.get(session_id)
             if existing_run_id:
@@ -79,7 +87,7 @@ class AssistantService:
 
         agent.configure_run_controls(
             cancellation_token=token,
-            event_handler=lambda event: self._record_event(run_id, event),
+            event_handler=lambda event: self._record_agent_event(run_id, agent, event),
             approval_handler=lambda request: self._wait_for_approval(run_id, request),
             approval_precheck_handler=self._is_preapproved,
         )
@@ -129,6 +137,8 @@ class AssistantService:
                 user_message = user_message(agent, run)
             user_message = str(user_message)
             run.answer = agent.ask(user_message, run_id=run.run_id)
+            if run.citations:
+                self._attach_citations(agent, run.citations)
             if agent.current_task_state is not None:
                 run.status = agent.current_task_state.status
             elif run.cancellation_token.cancelled:
@@ -193,6 +203,38 @@ class AssistantService:
                 del run.events[:-self.event_limit]
         if self.event_handler is not None:
             self.event_handler(dict(event))
+
+    def _record_agent_event(self, run_id, agent, event):
+        """Keep terminal events last while exposing citations as a stream event."""
+        event = dict(event)
+        event_type = str(event.get("event_type") or "")
+        if event_type == "run.completed":
+            with self._lock:
+                run = self._runs.get(run_id)
+                citations = [dict(item) for item in (run.citations if run else [])]
+            if citations:
+                self._attach_citations(agent, citations)
+                sequence = int(event.get("sequence") or 0)
+                citation_event = RunEvent(
+                    event_type="retrieval.citations",
+                    run_id=run_id,
+                    session_id=agent.session["id"],
+                    sequence=sequence,
+                    payload={"citations": citations},
+                ).to_dict()
+                event["sequence"] = sequence + 1
+                agent._event_sequences[run_id] = sequence + 1
+                self._record_event(run_id, citation_event)
+        self._record_event(run_id, event)
+
+    @staticmethod
+    def _attach_citations(agent, citations):
+        for item in reversed(agent.session.get("history", [])):
+            if item.get("role") == "assistant":
+                if item.get("citations") != citations:
+                    item["citations"] = [dict(citation) for citation in citations]
+                    agent.session_path = agent.session_store.save(agent.session)
+                break
 
     def _wait_for_approval(self, run_id, request):
         approval_id = str(request.get("approval_id", ""))

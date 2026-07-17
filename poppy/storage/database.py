@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 SEARCH_TERM_PATTERN = re.compile(r"[A-Za-z0-9_.+-]{2,}|[\u3400-\u9fff]{2,}")
 CHINESE_SPAN_PATTERN = re.compile(r"[\u3400-\u9fff]{2,}")
 SEARCH_STOP_TERMS = {"这个", "那个", "文件", "文档", "里面", "什么", "怎么", "如何", "请问", "一下", "的是", "设计的"}
@@ -63,6 +63,7 @@ def utc_now():
 class DesktopDatabase:
     def __init__(self, path):
         path = Path(path)
+        self.path = path.expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
@@ -219,6 +220,87 @@ class DesktopDatabase:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(session_id, path)
                 );
+                CREATE TABLE IF NOT EXISTS knowledge_spaces (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'notebook',
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_space_sources (
+                    space_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(space_id, source_id)
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_space_documents (
+                    space_id TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(space_id, document_id)
+                );
+                CREATE TABLE IF NOT EXISTS source_versions (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(document_id, sha256)
+                );
+                CREATE TABLE IF NOT EXISTS document_sections (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    heading TEXT NOT NULL DEFAULT '',
+                    level INTEGER NOT NULL DEFAULT 0,
+                    page_start INTEGER,
+                    page_end INTEGER,
+                    summary TEXT NOT NULL DEFAULT '',
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(document_id, ordinal)
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_notes (
+                    id TEXT PRIMARY KEY,
+                    space_id TEXT NOT NULL DEFAULT '',
+                    document_id TEXT NOT NULL DEFAULT '',
+                    chunk_id INTEGER,
+                    quote TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS answer_citations (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    citation_index INTEGER NOT NULL,
+                    document_id TEXT NOT NULL,
+                    chunk_id INTEGER NOT NULL,
+                    quote TEXT NOT NULL,
+                    location_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, citation_index)
+                );
+                CREATE TABLE IF NOT EXISTS index_jobs (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    path TEXT NOT NULL DEFAULT '',
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    stage TEXT NOT NULL DEFAULT 'queued',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_index_jobs_source_status
+                    ON index_jobs(source_id, status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_source_versions_document
+                    ON source_versions(document_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_sections_document
+                    ON document_sections(document_id, ordinal);
                 """
             )
             try:
@@ -249,6 +331,14 @@ class DesktopDatabase:
             if "locked_document_id" not in session_columns:
                 self.connection.execute(
                     "ALTER TABLE sessions ADD COLUMN locked_document_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "knowledge_scope_kind" not in session_columns:
+                self.connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN knowledge_scope_kind TEXT NOT NULL DEFAULT 'auto'"
+                )
+            if "knowledge_scope_id" not in session_columns:
+                self.connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN knowledge_scope_id TEXT NOT NULL DEFAULT ''"
                 )
             source_columns = {
                 row["name"]
@@ -281,6 +371,33 @@ class DesktopDatabase:
                 self.connection.execute(
                     "ALTER TABLE document_chunks ADD COLUMN embedding_base64 TEXT NOT NULL DEFAULT ''"
                 )
+            for name, definition in (
+                ("section_id", "TEXT NOT NULL DEFAULT ''"),
+                ("section_title", "TEXT NOT NULL DEFAULT ''"),
+                ("context_text", "TEXT NOT NULL DEFAULT ''"),
+                ("embedding_model", "TEXT NOT NULL DEFAULT ''"),
+                ("embedding_dimension", "INTEGER NOT NULL DEFAULT 0"),
+                ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in chunk_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE document_chunks ADD COLUMN {name} {definition}"
+                    )
+            document_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            for name, definition in (
+                ("title", "TEXT NOT NULL DEFAULT ''"),
+                ("authors", "TEXT NOT NULL DEFAULT ''"),
+                ("year", "INTEGER NOT NULL DEFAULT 0"),
+                ("summary", "TEXT NOT NULL DEFAULT ''"),
+                ("metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+            ):
+                if name not in document_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE documents ADD COLUMN {name} {definition}"
+                    )
             # 早期版本的默认标题是英文，首次打开新版时统一为中文。
             self.connection.execute(
                 "UPDATE sessions SET title = ? WHERE title = ?",
@@ -339,6 +456,28 @@ class DesktopDatabase:
             cursor = self.connection.execute(
                 "UPDATE sessions SET locked_document_id = ?, updated_at = ? WHERE id = ?",
                 (str(document_id or ""), utc_now(), str(session_id)),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"unknown session: {session_id}")
+        return self.get_session(session_id)
+
+    def set_session_knowledge_scope(self, session_id, kind="auto", scope_id=""):
+        kind = str(kind or "auto").strip().lower()
+        if kind not in {"auto", "all", "project", "notebook", "document"}:
+            raise ValueError("invalid knowledge scope kind")
+        scope_id = str(scope_id or "")
+        if kind == "notebook" and self.get_knowledge_space(scope_id) is None:
+            raise KeyError(f"unknown knowledge space: {scope_id}")
+        if kind == "document" and self.get_document(scope_id) is None:
+            raise KeyError(f"unknown document: {scope_id}")
+        if kind not in {"notebook", "document"}:
+            scope_id = ""
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                """UPDATE sessions SET knowledge_scope_kind = ?, knowledge_scope_id = ?,
+                locked_document_id = CASE WHEN ? = 'document' THEN ? ELSE '' END,
+                updated_at = ? WHERE id = ?""",
+                (kind, scope_id, kind, scope_id, utc_now(), str(session_id)),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"unknown session: {session_id}")
@@ -447,6 +586,138 @@ class DesktopDatabase:
             "SELECT * FROM session_attachments WHERE session_id = ? ORDER BY created_at",
             (str(session_id),),
         )
+
+    def create_knowledge_space(self, name, kind="notebook", description=""):
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("knowledge space name must not be empty")
+        kind = str(kind or "notebook").strip().lower()
+        if kind not in {"notebook", "project"}:
+            raise ValueError("knowledge space kind must be notebook or project")
+        space_id = "space_" + uuid4().hex
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO knowledge_spaces(id, name, kind, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (space_id, name, kind, str(description or "").strip(), timestamp, timestamp),
+            )
+        return self.get_knowledge_space(space_id)
+
+    def list_knowledge_spaces(self):
+        rows = self._all(
+            """SELECT s.*,
+            (SELECT COUNT(*) FROM knowledge_space_sources x WHERE x.space_id = s.id) AS source_count,
+            (SELECT COUNT(*) FROM knowledge_space_documents x WHERE x.space_id = s.id) AS document_count
+            FROM knowledge_spaces s ORDER BY lower(s.name), s.created_at"""
+        )
+        return rows
+
+    def get_knowledge_space(self, space_id):
+        return self._one("SELECT * FROM knowledge_spaces WHERE id = ?", (str(space_id),))
+
+    def delete_knowledge_space(self, space_id):
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM knowledge_spaces WHERE id = ?", (str(space_id),)
+            )
+            self.connection.execute(
+                "DELETE FROM knowledge_space_sources WHERE space_id = ?", (str(space_id),)
+            )
+            self.connection.execute(
+                "DELETE FROM knowledge_space_documents WHERE space_id = ?", (str(space_id),)
+            )
+            self.connection.execute(
+                "UPDATE sessions SET knowledge_scope_kind='auto', knowledge_scope_id='' WHERE knowledge_scope_id = ?",
+                (str(space_id),),
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"unknown knowledge space: {space_id}")
+
+    def set_knowledge_space_sources(self, space_id, source_ids):
+        if self.get_knowledge_space(space_id) is None:
+            raise KeyError(f"unknown knowledge space: {space_id}")
+        source_ids = list(dict.fromkeys(str(item) for item in (source_ids or [])))
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            known = {
+                row["id"]
+                for row in self.connection.execute(
+                    "SELECT id FROM library_sources WHERE id IN (" + ",".join("?" for _ in source_ids) + ")",
+                    tuple(source_ids),
+                ).fetchall()
+            } if source_ids else set()
+            if known != set(source_ids):
+                raise KeyError("knowledge space contains an unknown source")
+            self.connection.execute(
+                "DELETE FROM knowledge_space_sources WHERE space_id = ?", (str(space_id),)
+            )
+            self.connection.executemany(
+                "INSERT INTO knowledge_space_sources(space_id, source_id, created_at) VALUES (?, ?, ?)",
+                [(str(space_id), source_id, timestamp) for source_id in source_ids],
+            )
+            self.connection.execute(
+                "UPDATE knowledge_spaces SET updated_at = ? WHERE id = ?", (timestamp, str(space_id))
+            )
+        return self.get_knowledge_space_scope(space_id)
+
+    def set_knowledge_space_documents(self, space_id, document_ids):
+        if self.get_knowledge_space(space_id) is None:
+            raise KeyError(f"unknown knowledge space: {space_id}")
+        document_ids = list(dict.fromkeys(str(item) for item in (document_ids or [])))
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            known = {
+                row["id"]
+                for row in self.connection.execute(
+                    "SELECT id FROM documents WHERE id IN (" + ",".join("?" for _ in document_ids) + ")",
+                    tuple(document_ids),
+                ).fetchall()
+            } if document_ids else set()
+            if known != set(document_ids):
+                raise KeyError("knowledge space contains an unknown document")
+            self.connection.execute(
+                "DELETE FROM knowledge_space_documents WHERE space_id = ?", (str(space_id),)
+            )
+            self.connection.executemany(
+                "INSERT INTO knowledge_space_documents(space_id, document_id, created_at) VALUES (?, ?, ?)",
+                [(str(space_id), document_id, timestamp) for document_id in document_ids],
+            )
+            self.connection.execute(
+                "UPDATE knowledge_spaces SET updated_at = ? WHERE id = ?", (timestamp, str(space_id))
+            )
+        return self.get_knowledge_space_scope(space_id)
+
+    def get_knowledge_space_scope(self, space_id):
+        space = self.get_knowledge_space(space_id)
+        if space is None:
+            raise KeyError(f"unknown knowledge space: {space_id}")
+        source_ids = [
+            row["source_id"] for row in self._all(
+                "SELECT source_id FROM knowledge_space_sources WHERE space_id = ? ORDER BY source_id",
+                (str(space_id),),
+            )
+        ]
+        explicit_document_ids = [
+            row["document_id"] for row in self._all(
+                "SELECT document_id FROM knowledge_space_documents WHERE space_id = ? ORDER BY document_id",
+                (str(space_id),),
+            )
+        ]
+        document_ids = list(explicit_document_ids)
+        if source_ids:
+            document_ids.extend(
+                row["id"] for row in self._all(
+                    "SELECT id FROM documents WHERE source_id IN (" + ",".join("?" for _ in source_ids) + ")",
+                    tuple(source_ids),
+                )
+            )
+        return {
+            **space,
+            "source_ids": source_ids,
+            "document_ids": list(dict.fromkeys(document_ids)),
+            "explicit_document_ids": explicit_document_ids,
+        }
 
     def set_setting(self, key, value):
         encoded = json.dumps(value, ensure_ascii=False)
@@ -612,6 +883,57 @@ class DesktopDatabase:
             (max(1, min(int(limit), 1000)),),
         )
 
+    def create_index_job(self, source_id, operation, path=""):
+        job_id = "index_" + uuid4().hex
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO index_jobs(
+                    id, source_id, path, operation, status, stage, progress,
+                    error, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, 'queued', 'queued', 0, '', ?, ?, '')""",
+                (job_id, str(source_id), str(path or ""), str(operation), timestamp, timestamp),
+            )
+        return self.get_index_job(job_id)
+
+    def update_index_job(self, job_id, status=None, stage=None, progress=None, error=None):
+        current = self.get_index_job(job_id)
+        if current is None:
+            raise KeyError(f"unknown index job: {job_id}")
+        next_status = str(status if status is not None else current["status"])
+        next_stage = str(stage if stage is not None else current["stage"])
+        next_progress = max(0, min(100, int(progress if progress is not None else current["progress"])))
+        next_error = str(error if error is not None else current["error"])
+        completed_at = utc_now() if next_status in {"completed", "failed", "cancelled"} else ""
+        with self.lock, self.connection:
+            self.connection.execute(
+                """UPDATE index_jobs SET status=?, stage=?, progress=?, error=?,
+                updated_at=?, completed_at=? WHERE id=?""",
+                (next_status, next_stage, next_progress, next_error, utc_now(), completed_at, str(job_id)),
+            )
+        return self.get_index_job(job_id)
+
+    def get_index_job(self, job_id):
+        return self._one("SELECT * FROM index_jobs WHERE id = ?", (str(job_id),))
+
+    def list_index_jobs(self, source_id="", limit=200):
+        limit = max(1, min(int(limit), 1000))
+        if source_id:
+            return self._all(
+                "SELECT * FROM index_jobs WHERE source_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (str(source_id), limit),
+            )
+        return self._all("SELECT * FROM index_jobs ORDER BY updated_at DESC LIMIT ?", (limit,))
+
+    def recover_interrupted_index_jobs(self):
+        with self.lock, self.connection:
+            self.connection.execute(
+                """UPDATE index_jobs SET status='queued', stage='recovered', progress=0,
+                error='', updated_at=?, completed_at=''
+                WHERE status IN ('running', 'indexing')""",
+                (utc_now(),),
+            )
+
     def delete_library_source(self, source_id):
         source = self.get_library_source(source_id)
         if source is None:
@@ -628,59 +950,140 @@ class DesktopDatabase:
             self.connection.execute(
                 "DELETE FROM index_failures WHERE source_id = ?", (str(source_id),)
             )
+            self.connection.execute(
+                "DELETE FROM knowledge_space_sources WHERE source_id = ?", (str(source_id),)
+            )
+            self.connection.execute(
+                "DELETE FROM index_jobs WHERE source_id = ?", (str(source_id),)
+            )
             self.connection.execute("DELETE FROM library_sources WHERE id = ?", (str(source_id),))
 
-    def upsert_document(self, source_id, path, display_name, mime_type, size, mtime_ns, sha256, content):
+    def upsert_document(
+        self,
+        source_id,
+        path,
+        display_name,
+        mime_type,
+        size,
+        mtime_ns,
+        sha256,
+        content,
+        metadata=None,
+    ):
         resolved = str(Path(path).expanduser().resolve())
         document_id = "doc_" + uuid4().hex
         timestamp = utc_now()
+        metadata = dict(metadata or {})
+        title = str(metadata.get("title") or display_name)
+        authors = metadata.get("authors") or ""
+        if isinstance(authors, (list, tuple)):
+            authors = ", ".join(str(item) for item in authors)
+        year = int(metadata.get("year") or 0)
+        summary = str(metadata.get("summary") or "")
+        metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
         with self.lock, self.connection:
-            row = self.connection.execute("SELECT id FROM documents WHERE path = ?", (resolved,)).fetchone()
+            row = self.connection.execute(
+                "SELECT id, sha256 FROM documents WHERE path = ?", (resolved,)
+            ).fetchone()
             if row:
                 document_id = row["id"]
                 self.connection.execute(
                     """UPDATE documents SET source_id=?, display_name=?, mime_type=?, size=?, mtime_ns=?,
-                    sha256=?, content=?, updated_at=? WHERE id=?""",
-                    (str(source_id), str(display_name), str(mime_type), int(size), int(mtime_ns), str(sha256), str(content), timestamp, document_id),
+                    sha256=?, content=?, title=?, authors=?, year=?, summary=?, metadata_json=?,
+                    updated_at=? WHERE id=?""",
+                    (
+                        str(source_id), str(display_name), str(mime_type), int(size), int(mtime_ns),
+                        str(sha256), str(content), title, str(authors), year, summary, metadata_json,
+                        timestamp, document_id,
+                    ),
                 )
-                self._delete_chunks_locked(document_id)
             else:
                 self.connection.execute(
                     """INSERT INTO documents(id, source_id, path, display_name, mime_type, size, mtime_ns,
-                    sha256, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (document_id, str(source_id), resolved, str(display_name), str(mime_type), int(size), int(mtime_ns), str(sha256), str(content), timestamp, timestamp),
+                    sha256, content, title, authors, year, summary, metadata_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        document_id, str(source_id), resolved, str(display_name), str(mime_type),
+                        int(size), int(mtime_ns), str(sha256), str(content), title, str(authors),
+                        year, summary, metadata_json, timestamp, timestamp,
+                    ),
                 )
-            if getattr(self, "fts_available", False):
-                self.connection.execute("DELETE FROM documents_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE document_id = ?)", (document_id,))
+            self.connection.execute(
+                """INSERT OR IGNORE INTO source_versions(
+                    id, document_id, sha256, size, mtime_ns, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                ("version_" + uuid4().hex, document_id, str(sha256), int(size), int(mtime_ns), timestamp),
+            )
             return self._one_locked("SELECT * FROM documents WHERE id = ?", (document_id,))
 
     def replace_document_chunks(self, document_id, chunks):
         with self.lock, self.connection:
             self._delete_chunks_locked(document_id)
+            self.connection.execute(
+                "DELETE FROM document_sections WHERE document_id = ?", (str(document_id),)
+            )
+            section_ids = {}
+            inserted = []
             for chunk_index, item in enumerate(chunks):
+                location = item.get("location") or {}
+                section_title = str(item.get("section_title") or location.get("section") or "").strip()
+                section_key = (section_title, int(location.get("page") or 0))
+                section_id = str(item.get("section_id") or "")
+                if not section_id:
+                    section_id = section_ids.get(section_key, "")
+                if not section_id:
+                    section_id = "section_" + uuid4().hex
+                    section_ids[section_key] = section_id
+                    page = int(location.get("page") or 0) or None
+                    self.connection.execute(
+                        """INSERT INTO document_sections(
+                            id, document_id, heading, level, page_start, page_end, summary, ordinal
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            section_id,
+                            str(document_id),
+                            section_title,
+                            int(item.get("section_level") or 0),
+                            page,
+                            page,
+                            str(item.get("section_summary") or ""),
+                            len(section_ids) - 1,
+                        ),
+                    )
+                content = str(item["content"])
+                context_text = str(item.get("context_text") or content)
                 cursor = self.connection.execute(
                     """INSERT INTO document_chunks(
                         document_id, chunk_index, line_start, line_end, location_json, content,
-                        embedding_language, embedding_base64
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        embedding_language, embedding_base64, section_id, section_title, context_text,
+                        embedding_model, embedding_dimension, content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(document_id),
                         chunk_index,
                         int(item["line_start"]),
                         int(item["line_end"]),
-                        json.dumps(item.get("location") or {}, ensure_ascii=False, sort_keys=True),
-                        str(item["content"]),
+                        json.dumps(location, ensure_ascii=False, sort_keys=True),
+                        content,
                         str(item.get("embedding_language") or ""),
                         str(item.get("embedding_base64") or ""),
+                        section_id,
+                        section_title,
+                        context_text,
+                        str(item.get("embedding_model") or ""),
+                        int(item.get("embedding_dimension") or 0),
+                        str(item.get("content_hash") or ""),
                     ),
                 )
                 chunk_id = cursor.lastrowid
+                inserted.append({**dict(item), "id": chunk_id, "chunk_id": chunk_id, "document_id": str(document_id), "section_id": section_id})
                 if getattr(self, "fts_available", False):
                     document = self.connection.execute("SELECT display_name, path FROM documents WHERE id = ?", (str(document_id),)).fetchone()
                     self.connection.execute(
                         "INSERT INTO documents_fts(rowid, title, path, content) VALUES (?, ?, ?, ?)",
-                        (chunk_id, document["display_name"], document["path"], str(item["content"])),
+                        (chunk_id, document["display_name"], document["path"], context_text),
                     )
+            return inserted
 
     def delete_documents_not_in(self, source_id, paths):
         normalized = {str(Path(path).expanduser().resolve()) for path in paths}
@@ -716,7 +1119,8 @@ class DesktopDatabase:
     def list_document_summaries(self, source_ids=None):
         source_ids = [str(item) for item in (source_ids or [])]
         sql = """SELECT d.id, d.source_id, d.path, d.display_name, d.mime_type,
-        d.size, d.mtime_ns, d.updated_at, COUNT(c.id) AS chunk_count
+        d.size, d.mtime_ns, d.updated_at, d.title, d.authors, d.year, d.summary,
+        COUNT(c.id) AS chunk_count
         FROM documents d LEFT JOIN document_chunks c ON c.document_id = d.id"""
         params = []
         if source_ids:
@@ -737,7 +1141,8 @@ class DesktopDatabase:
     def list_document_chunks(self, document_id):
         rows = self._all(
             """SELECT id, document_id, chunk_index, line_start, line_end, location_json, content,
-            embedding_language, embedding_base64
+            embedding_language, embedding_base64, section_id, section_title, context_text,
+            embedding_model, embedding_dimension, content_hash
             FROM document_chunks WHERE document_id = ? ORDER BY chunk_index""",
             (str(document_id),),
         )
@@ -749,12 +1154,40 @@ class DesktopDatabase:
                 row.pop("location_json", None)
         return rows
 
-    def document_embeddings_ready(self, document_id):
+    def get_chunks_by_ids(self, chunk_ids):
+        chunk_ids = [int(item) for item in chunk_ids]
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" for _ in chunk_ids)
+        rows = self._all(
+            """SELECT c.id AS chunk_id, d.id, d.source_id, d.path, d.display_name,
+            c.line_start, c.line_end, c.location_json, c.content, c.section_id,
+            c.section_title, c.context_text, c.embedding_model, c.embedding_dimension
+            FROM document_chunks c JOIN documents d ON d.id = c.document_id
+            WHERE c.id IN (""" + placeholders + ")",
+            tuple(chunk_ids),
+        )
+        by_id = {int(row["chunk_id"]): row for row in rows}
+        ordered = [by_id[item] for item in chunk_ids if item in by_id]
+        for row in ordered:
+            try:
+                row["location"] = json.loads(row.pop("location_json") or "{}")
+            except (TypeError, ValueError):
+                row["location"] = {}
+                row.pop("location_json", None)
+        return ordered
+
+    def document_embeddings_ready(self, document_id, model_id=""):
+        model_clause = ""
+        params = [str(document_id)]
+        if model_id:
+            model_clause = " AND embedding_model = ?"
+            params.append(str(model_id))
         row = self._one(
             """SELECT COUNT(*) AS total,
-            SUM(CASE WHEN embedding_base64 <> '' THEN 1 ELSE 0 END) AS embedded
+            SUM(CASE WHEN embedding_base64 <> ''""" + model_clause + """ THEN 1 ELSE 0 END) AS embedded
             FROM document_chunks WHERE document_id = ?""",
-            (str(document_id),),
+            tuple(params[1:] + params[:1]) if model_id else tuple(params),
         )
         return bool(row and int(row.get("total") or 0) > 0 and int(row.get("total") or 0) == int(row.get("embedded") or 0))
 
@@ -855,6 +1288,110 @@ class DesktopDatabase:
     def list_audit_events(self, limit=200):
         return self._all("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 1000)),))
 
+    def add_knowledge_note(self, content, space_id="", document_id="", chunk_id=None, quote=""):
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("knowledge note content must not be empty")
+        if space_id and self.get_knowledge_space(space_id) is None:
+            raise KeyError(f"unknown knowledge space: {space_id}")
+        if document_id and self.get_document(document_id) is None:
+            raise KeyError(f"unknown document: {document_id}")
+        note_id = "note_" + uuid4().hex
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO knowledge_notes(
+                    id, space_id, document_id, chunk_id, quote, content, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    note_id, str(space_id or ""), str(document_id or ""),
+                    int(chunk_id) if chunk_id is not None else None,
+                    str(quote or ""), content, timestamp, timestamp,
+                ),
+            )
+        return self._one("SELECT * FROM knowledge_notes WHERE id = ?", (note_id,))
+
+    def list_knowledge_notes(self, space_id="", document_id=""):
+        clauses, params = [], []
+        if space_id:
+            clauses.append("space_id = ?")
+            params.append(str(space_id))
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(str(document_id))
+        sql = "SELECT * FROM knowledge_notes"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY updated_at DESC"
+        return self._all(sql, tuple(params))
+
+    def search_knowledge_notes(self, query, space_id="", document_id="", limit=8):
+        terms = _search_terms(str(query or ""))[:12]
+        if not terms:
+            return []
+        clauses = ["(" + " OR ".join("lower(content || ' ' || quote) LIKE ?" for _ in terms) + ")"]
+        params = [f"%{term.casefold()}%" for term in terms]
+        if space_id:
+            clauses.append("space_id = ?")
+            params.append(str(space_id))
+        if document_id:
+            clauses.append("document_id = ?")
+            params.append(str(document_id))
+        params.append(max(1, min(int(limit), 50)))
+        return self._all(
+            "SELECT * FROM knowledge_notes WHERE " + " AND ".join(clauses)
+            + " ORDER BY updated_at DESC LIMIT ?",
+            tuple(params),
+        )
+
+    def delete_knowledge_note(self, note_id):
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM knowledge_notes WHERE id = ?", (str(note_id),)
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"unknown knowledge note: {note_id}")
+
+    def replace_run_citations(self, run_id, session_id, citations):
+        timestamp = utc_now()
+        with self.lock, self.connection:
+            self.connection.execute(
+                "DELETE FROM answer_citations WHERE run_id = ?", (str(run_id),)
+            )
+            for index, citation in enumerate(citations, start=1):
+                self.connection.execute(
+                    """INSERT INTO answer_citations(
+                        id, run_id, session_id, citation_index, document_id, chunk_id,
+                        quote, location_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "citation_" + uuid4().hex,
+                        str(run_id),
+                        str(session_id),
+                        index,
+                        str(citation["document_id"]),
+                        int(citation["chunk_id"]),
+                        str(citation.get("quote") or ""),
+                        json.dumps(citation.get("location") or {}, ensure_ascii=False, sort_keys=True),
+                        timestamp,
+                    ),
+                )
+        return self.list_run_citations(run_id)
+
+    def list_run_citations(self, run_id):
+        rows = self._all(
+            """SELECT a.*, d.display_name, d.path FROM answer_citations a
+            JOIN documents d ON d.id = a.document_id
+            WHERE a.run_id = ? ORDER BY a.citation_index""",
+            (str(run_id),),
+        )
+        for row in rows:
+            try:
+                row["location"] = json.loads(row.pop("location_json") or "{}")
+            except (TypeError, ValueError):
+                row["location"] = {}
+        return rows
+
     def add_memory(self, category, content, source_session_id=""):
         memory_id = "memory_" + uuid4().hex
         timestamp = utc_now()
@@ -936,6 +1473,25 @@ class DesktopDatabase:
         self.connection.execute(
             "UPDATE sessions SET locked_document_id = '', updated_at = ? WHERE locked_document_id = ?",
             (utc_now(), str(document_id)),
+        )
+        self.connection.execute(
+            "UPDATE sessions SET knowledge_scope_kind='auto', knowledge_scope_id='' WHERE knowledge_scope_kind='document' AND knowledge_scope_id = ?",
+            (str(document_id),),
+        )
+        self.connection.execute(
+            "DELETE FROM knowledge_space_documents WHERE document_id = ?", (str(document_id),)
+        )
+        self.connection.execute(
+            "DELETE FROM document_sections WHERE document_id = ?", (str(document_id),)
+        )
+        self.connection.execute(
+            "DELETE FROM source_versions WHERE document_id = ?", (str(document_id),)
+        )
+        self.connection.execute(
+            "DELETE FROM knowledge_notes WHERE document_id = ?", (str(document_id),)
+        )
+        self.connection.execute(
+            "DELETE FROM answer_citations WHERE document_id = ?", (str(document_id),)
         )
         self._delete_chunks_locked(document_id)
         self.connection.execute("DELETE FROM documents WHERE id = ?", (str(document_id),))

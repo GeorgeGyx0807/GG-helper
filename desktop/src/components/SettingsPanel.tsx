@@ -1,6 +1,6 @@
 import { Check, Copy, KeyRound, Link2, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ApprovalRule, AuditEvent, FeishuSettings, Grant, LibrarySource, MemoryItem, Settings } from "../types";
+import type { ApprovalRule, AuditEvent, FeishuSettings, Grant, IndexJob, KnowledgeSpace, LibrarySource, MemoryItem, Settings } from "../types";
 
 type Props = {
   settings: Settings;
@@ -9,6 +9,8 @@ type Props = {
   memories: MemoryItem[];
   approvalRules: ApprovalRule[];
   librarySources: LibrarySource[];
+  knowledgeSpaces: KnowledgeSpace[];
+  indexJobs: IndexJob[];
   auditEvents: AuditEvent[];
   onClose: () => void;
   onSaveSettings: (values: Partial<Settings>) => Promise<void>;
@@ -29,12 +31,15 @@ type Props = {
   onAddLibrarySource: () => void;
   onDeleteLibrarySource: (id: string) => Promise<void>;
   onReindexLibrary: (id?: string) => Promise<void>;
+  onCreateKnowledgeSpace: () => Promise<void>;
+  onDeleteKnowledgeSpace: (id: string) => Promise<void>;
 };
 
 export function SettingsPanel(props: Props) {
   const [model, setModel] = useState(props.settings.model);
   const [baseUrl, setBaseUrl] = useState(props.settings.base_url);
   const [timeout, setTimeoutValue] = useState(props.settings.timeout);
+  const [embeddingMode, setEmbeddingMode] = useState<NonNullable<Settings["embedding_mode"]>>(props.settings.embedding_mode || "balanced");
   const [apiKey, setApiKey] = useState("");
   const [memory, setMemory] = useState("");
   const [savingKey, setSavingKey] = useState(false);
@@ -64,6 +69,7 @@ export function SettingsPanel(props: Props) {
     setModel(props.settings.model);
     setBaseUrl(props.settings.base_url);
     setTimeoutValue(props.settings.timeout);
+    setEmbeddingMode(props.settings.embedding_mode || "balanced");
   }, [props.settings]);
 
   async function saveKey() {
@@ -131,7 +137,10 @@ export function SettingsPanel(props: Props) {
             <label><span>模型</span><input className="settings-field" value={model} onChange={(e) => setModel(e.target.value)} /></label>
             <label><span>API 地址</span><input className="settings-field" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></label>
             <label><span>超时时间（秒）</span><input className="settings-field" type="number" value={timeout} onChange={(e) => setTimeoutValue(Number(e.target.value))} /></label>
-            <button className="secondary-button" onClick={() => props.onSaveSettings({ model, base_url: baseUrl, timeout })}>保存模型设置</button>
+            <label><span>本地检索档位</span><select className="settings-field" value={embeddingMode} onChange={(event) => setEmbeddingMode(event.target.value as NonNullable<Settings["embedding_mode"]>)}><option value="off">节能 · 仅关键词</option><option value="balanced">均衡 · multilingual-e5-small</option><option value="quality">高质量 · 当前仍使用轻量模型</option></select></label>
+            <small>向量模型按需加载，索引完成后释放；模型异常时自动回退关键词检索。</small>
+            <button className="secondary-button" onClick={() => props.onSaveSettings({ model, base_url: baseUrl, timeout, embedding_mode: embeddingMode })}>保存模型设置</button>
+            {props.settings.knowledge_base_status && <div className="inline-success">知识库：{props.settings.knowledge_base_status.embedding.backend || "待加载"} · {props.settings.knowledge_base_status.vector_backend} · 可用磁盘 {(props.settings.knowledge_base_status.free_disk_bytes / 1024 ** 3).toFixed(1)}GB</div>}
             <div className="key-row">
               <KeyRound size={17} />
               <input className="settings-field" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={props.settings.api_key_configured ? "API 密钥已配置" : `输入${qwenConfigured ? " Qwen / DashScope" : "模型服务"} API 密钥`} />
@@ -311,6 +320,10 @@ export function SettingsPanel(props: Props) {
           <div className="settings-group">
             <div className="group-heading"><div><h3>个人资料库</h3><p>只索引已授权文件夹中的文本，撤销授权会立即移除对应索引。</p></div><button className="icon-button" onClick={props.onAddLibrarySource} aria-label="添加资料库目录"><Plus size={17} /></button></div>
             <div className="settings-list">
+              {props.knowledgeSpaces.map((space) => <div className="settings-list-item" key={space.id}><div><strong>Notebook · {space.name}</strong><span>{space.document_count} 篇文档 · {space.source_count} 个目录</span><small>可在聊天输入框上方切换到此范围</small></div><button className="icon-button danger" onClick={() => void props.onDeleteKnowledgeSpace(space.id)}><Trash2 size={16} /></button></div>)}
+              <button className="secondary-button compact" onClick={() => void props.onCreateKnowledgeSpace()}><Plus size={14} />用当前文档创建 Notebook</button>
+            </div>
+            <div className="settings-list">
               {props.librarySources.map((source) => (
                 <div className="settings-list-item" key={source.id}>
                   <div>
@@ -335,6 +348,7 @@ export function SettingsPanel(props: Props) {
                 </div>
               ))}
               {!props.librarySources.length && <p className="empty-copy">还没有资料库目录。授权文件夹后会自动建立本地索引。</p>}
+              {!!props.indexJobs.length && <details><summary>最近后台任务（{props.indexJobs.length}）</summary>{props.indexJobs.slice(0, 20).map((job) => <small key={job.id}>{job.path.split(/[\\/]/).pop()} · {job.stage} {job.progress}%{job.error ? ` · ${job.error}` : ""}</small>)}</details>}
             </div>
           </div>
 

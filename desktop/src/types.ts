@@ -11,6 +11,34 @@ export type SessionSummary = {
     path: string;
     display_name: string;
   } | null;
+  knowledge_scope?: KnowledgeScope;
+};
+
+export type KnowledgeScope = {
+  kind: "auto" | "all" | "project" | "notebook" | "document";
+  id: string;
+  label: string;
+};
+
+export type Citation = {
+  label: string;
+  source_id: string;
+  document_id: string;
+  chunk_id: number;
+  title: string;
+  path: string;
+  quote: string;
+  location: {
+    kind?: string;
+    page?: number;
+    sheet?: string;
+    row_start?: number;
+    row_end?: number;
+    line_start?: number;
+    line_end?: number;
+    bbox?: number[];
+    [key: string]: unknown;
+  };
 };
 
 export type HistoryItem = {
@@ -20,6 +48,7 @@ export type HistoryItem = {
   name?: string;
   args?: Record<string, unknown>;
   attachments?: string[];
+  citations?: Citation[];
 };
 
 export type SessionDetail = SessionSummary & { history: HistoryItem[] };
@@ -30,6 +59,7 @@ export type RunSnapshot = {
   status: "starting" | "running" | "completed" | "cancelled" | "failed";
   answer: string;
   error: string;
+  citations?: Citation[];
 };
 
 export type RunEvent = {
@@ -69,6 +99,15 @@ export type Settings = {
   max_steps?: number;
   max_new_tokens?: number;
   api_key_configured: boolean;
+  embedding_mode?: "off" | "native" | "balanced" | "quality";
+  knowledge_base_status?: {
+    free_disk_bytes: number;
+    minimum_free_disk_bytes: number;
+    indexing_allowed: boolean;
+    embedding: { mode?: string; backend?: string; model?: string; available?: boolean; error?: string };
+    vector_backend: string;
+    vector_error: string;
+  };
 };
 
 export type FeishuChannelSession = {
@@ -149,6 +188,48 @@ export type LibraryDocument = {
   mtime_ns: number;
   updated_at: string;
   chunk_count: number;
+  title?: string;
+  authors?: string;
+  year?: number | null;
+  summary?: string;
+};
+
+export type KnowledgeSpace = {
+  id: string;
+  name: string;
+  kind: "notebook" | "project";
+  description: string;
+  source_count: number;
+  document_count: number;
+  source_ids?: string[];
+  document_ids?: string[];
+  explicit_document_ids?: string[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type IndexJob = {
+  id: string;
+  source_id: string;
+  operation: string;
+  path: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  stage: string;
+  progress: number;
+  error: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type KnowledgeNote = {
+  id: string;
+  space_id: string;
+  document_id: string;
+  chunk_id?: number | null;
+  quote: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
 };
 
 export type IndexFailure = {

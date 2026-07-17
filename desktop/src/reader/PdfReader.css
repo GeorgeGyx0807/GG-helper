@@ -278,6 +278,9 @@
   color: var(--accent);
   border-color: #718133;
 }
+.textLayer .citation-highlight { background: rgba(204, 239, 82, .55); border-radius: 2px; box-shadow: 0 0 0 1px rgba(118, 145, 0, .18); }
+.pdf-citation-banner { position: absolute; z-index: 5; left: 16px; right: 16px; top: 16px; display: flex; gap: 8px; max-height: 72px; overflow: auto; padding: 9px 11px; border: 1px solid rgba(118, 145, 0, .35); border-radius: 9px; background: rgba(250, 255, 231, .94); color: #343b20; font-size: 12px; line-height: 1.45; box-shadow: 0 6px 20px rgba(28, 34, 10, .12); }
+.pdf-citation-banner strong { flex: 0 0 auto; color: #6d8500; }
 
 .pdf-ai-heading button.active {
   color: white;
