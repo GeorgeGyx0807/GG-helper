@@ -10,9 +10,9 @@ import os
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
 from .config import load_project_env, provider_env
-from .legacy_migration import migrate_workspace_state
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Poppy, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -225,7 +225,7 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
-    state_root = migrate_workspace_state(workspace.repo_root)
+    state_root = Path(workspace.repo_root) / ".poppy"
     store = SessionStore(state_root / "sessions")
     model = _build_model_client(args)
     session_id = args.resume

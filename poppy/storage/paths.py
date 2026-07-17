@@ -1,7 +1,6 @@
 """Platform-aware paths for the Poppy desktop application."""
 
 import os
-import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,7 +80,6 @@ class AppPaths:
 
     def ensure(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self._migrate_legacy_database()
         for path in (
             self.root,
             self.sessions,
@@ -98,24 +96,3 @@ class AppPaths:
         ):
             path.mkdir(parents=True, exist_ok=True)
         return self
-
-    def _migrate_legacy_database(self):
-        if self.database.exists():
-            return
-        legacy = self.root / ("pi" + "co.db")
-        if not legacy.is_file():
-            return
-        staging = self.database.with_suffix(".db.migrating")
-        staging.unlink(missing_ok=True)
-        source = sqlite3.connect(f"file:{legacy}?mode=ro", uri=True)
-        target = sqlite3.connect(staging)
-        try:
-            source.backup(target)
-            target.close()
-            target = None
-            staging.replace(self.database)
-        finally:
-            if target is not None:
-                target.close()
-            source.close()
-            staging.unlink(missing_ok=True)
