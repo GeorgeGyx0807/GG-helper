@@ -59,13 +59,15 @@ REPL 内置命令与会话路径：
 
 需要 Python 3.10+。
 
-如果你用 `uv`，直接安装依赖：
+推荐使用 `uv`。在仓库根目录执行：
 
 ```bash
 uv sync
 ```
 
-如果你已经在自己的 Python 环境里工作，也可以直接装成可编辑模式：
+项目已经在 `pyproject.toml` 中声明了 `poppy` 命令和本地 `.uv-cache/` 缓存目录；安装完成后，下面的命令都应从仓库根目录执行。
+
+如果你不使用 `uv`，也可以在 Python 3.10+ 环境中安装成可编辑模式：
 
 ```bash
 pip install -e .
@@ -73,10 +75,22 @@ pip install -e .
 
 ## 快速开始
 
-在当前仓库里启动交互模式。默认 provider 是 DeepSeek：
+安装完成后，在当前仓库启动 Poppy 交互模式：
 
 ```bash
 uv run poppy
+```
+
+验证 CLI 是否已经正确安装：
+
+```bash
+uv run poppy --help
+```
+
+如果你从其他目录启动，先指定 Poppy 工作区：
+
+```bash
+uv run --project /path/to/poppy poppy --cwd /path/to/repo
 ```
 
 指定另一个工作目录：
@@ -96,6 +110,8 @@ uv run poppy "inspect the test failures and propose a fix"
 ```bash
 python -m poppy
 ```
+
+如果终端提示 `poppy: command not found`，请确认当前目录是本仓库根目录并先运行 `uv sync`；不要直接执行裸的 `poppy`，使用 `uv run poppy` 会自动使用项目环境。
 
 ## 模型后端
 

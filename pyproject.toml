@@ -33,3 +33,7 @@ include = ["poppy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# Keep uv's project cache local so `uv run poppy` works on locked-down machines.
+cache-dir = ".uv-cache"
